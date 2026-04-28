@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6 - 2026-04-28
+
+- Publish best-effort `llm.registry` live readiness and discovered-model availability events using `lex-llm` registry envelopes when transport is already available.
+
 ## 0.1.5 - 2026-04-28
 
 - Require current shared Legion JSON, logging, settings, and `lex-llm >= 0.1.5` runtime dependencies.

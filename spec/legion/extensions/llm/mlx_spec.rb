@@ -5,6 +5,7 @@ require 'spec_helper'
 RSpec.describe Legion::Extensions::Llm::Mlx do
   let(:provider) { described_class::Provider.new(Legion::Extensions::Llm.config) }
   let(:model) { Legion::Extensions::Llm::Model::Info.new(id: 'mlx-community/Qwen3-14B-4bit', provider: :mlx) }
+  let(:registry_publisher) { instance_double(described_class::RegistryPublisher) }
 
   it 'exposes provider defaults with inherited fleet settings' do
     settings = described_class.default_settings
@@ -50,6 +51,34 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     expect(parsed_models.map { |model| model.modalities.to_h }).to eq(expected_modalities)
   end
 
+  it 'publishes live readiness metadata asynchronously through the registry publisher' do
+    allow(described_class::Provider).to receive(:registry_publisher).and_return(registry_publisher)
+    allow(provider.connection).to receive(:get).with('/health').and_return(fake_response({}))
+    allow(registry_publisher).to receive(:publish_readiness_async)
+
+    readiness = provider.readiness(live: true)
+
+    expect(registry_publisher).to have_received(:publish_readiness_async).with(readiness)
+  end
+
+  it 'publishes discovered models asynchronously through the registry publisher' do
+    stub_registry_publisher
+    stub_model_discovery
+
+    models = provider.list_models
+
+    expect(registry_publisher).to have_received(:publish_models_async)
+      .with(models, readiness: hash_including(provider: :mlx, live: false))
+  end
+
+  it 'builds sanitized lex-llm registry events for MLX model availability' do
+    events = capture_registry_events([model], readiness: { ready: true })
+
+    expect(events.first.to_h).to include(event_type: :offering_available)
+    expect(events.first.to_h.dig(:offering, :provider_family)).to eq(:mlx)
+    expect(events.first.to_h.dig(:offering, :model)).to eq('mlx-community/Qwen3-14B-4bit')
+  end
+
   def chat_payload
     message = Legion::Extensions::Llm::Message.new(role: :user, content: 'hello')
     provider.send(:render_payload, [message], tools: {}, temperature: 0.2, model: model, stream: false,
@@ -79,5 +108,24 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
   def fake_response(body)
     Struct.new(:body).new(body)
+  end
+
+  def stub_model_discovery
+    allow(provider.connection).to receive(:get).with('/v1/models').and_return(fake_response(models_body))
+  end
+
+  def stub_registry_publisher
+    allow(described_class::Provider).to receive(:registry_publisher).and_return(registry_publisher)
+    allow(registry_publisher).to receive(:publish_models_async)
+  end
+
+  def capture_registry_events(models, readiness:)
+    publisher = described_class::RegistryPublisher.new
+    events = []
+    allow(publisher).to receive(:publishing_available?).and_return(true)
+    allow(publisher).to receive(:publish_event) { |event| events << event }
+    allow(Thread).to receive(:new).and_yield
+    publisher.publish_models_async(models, readiness:)
+    events
   end
 end

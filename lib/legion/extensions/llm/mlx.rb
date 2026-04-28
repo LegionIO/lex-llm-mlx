@@ -2,6 +2,8 @@
 
 require 'legion/extensions/llm'
 require 'legion/extensions/llm/mlx/provider'
+require 'legion/extensions/llm/mlx/registry_event_builder'
+require 'legion/extensions/llm/mlx/registry_publisher'
 require 'legion/extensions/llm/mlx/version'
 
 module Legion

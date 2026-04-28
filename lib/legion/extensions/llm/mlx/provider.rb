@@ -11,11 +11,17 @@ module Legion
           include Legion::Extensions::Llm::Provider::OpenAICompatible
 
           class << self
+            attr_writer :registry_publisher
+
             def slug = 'mlx'
             def local? = true
             def configuration_options = %i[mlx_api_base mlx_api_key]
             def configuration_requirements = []
             def capabilities = Capabilities
+
+            def registry_publisher
+              @registry_publisher ||= RegistryPublisher.new
+            end
           end
 
           # Conservative capability predicates for local MLX OpenAI-compatible servers.
@@ -57,6 +63,18 @@ module Legion
 
           def health
             connection.get(health_url).body
+          end
+
+          def readiness(live: false)
+            super.tap do |metadata|
+              self.class.registry_publisher.publish_readiness_async(metadata) if live
+            end
+          end
+
+          def list_models
+            super.tap do |models|
+              self.class.registry_publisher.publish_models_async(models, readiness: readiness(live: false))
+            end
           end
         end
       end
