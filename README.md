@@ -22,7 +22,7 @@ Defaults target `http://localhost:8000`, mark the provider as `:local`, and allo
 ## Configuration
 
 ```ruby
-LexLLM.configure do |config|
+Legion::Extensions::Llm.configure do |config|
   config.mlx_api_base = 'http://localhost:8000'
   config.mlx_api_key = ENV['MLX_API_KEY']
 end
@@ -37,4 +37,4 @@ end
 - `embedding_url`: `/v1/embeddings`
 - `health_url`: `/health`
 
-The provider uses the shared `LexLLM::Provider::OpenAICompatible` adapter so Legion routing can treat MLX, vLLM, OpenAI, and other compatible servers consistently while preserving provider-specific settings and health behavior.
+The provider uses the shared `Legion::Extensions::Llm::Provider::OpenAICompatible` adapter so Legion routing can treat MLX, vLLM, OpenAI, and other compatible servers consistently while preserving provider-specific settings and health behavior.

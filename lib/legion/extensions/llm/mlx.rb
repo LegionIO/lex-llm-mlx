@@ -34,5 +34,5 @@ module Legion
   end
 end
 
-LexLLM::Provider.register(Legion::Extensions::Llm::Mlx::PROVIDER_FAMILY,
-                          Legion::Extensions::Llm::Mlx::Provider)
+Legion::Extensions::Llm::Provider.register(Legion::Extensions::Llm::Mlx::PROVIDER_FAMILY,
+                                           Legion::Extensions::Llm::Mlx::Provider)

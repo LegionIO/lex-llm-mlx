@@ -1,14 +1,14 @@
 # frozen_string_literal: true
 
-require 'lex_llm'
+require 'legion/extensions/llm'
 
 module Legion
   module Extensions
     module Llm
       module Mlx
         # MLX provider implementation for local OpenAI-compatible servers.
-        class Provider < LexLLM::Provider
-          include LexLLM::Provider::OpenAICompatible
+        class Provider < Legion::Extensions::Llm::Provider
+          include Legion::Extensions::Llm::Provider::OpenAICompatible
 
           class << self
             def slug = 'mlx'
