@@ -25,8 +25,17 @@ module Legion
             def chat?(model) = !embeddings?(model)
             def streaming?(model) = chat?(model)
             def vision?(model) = model_id(model).match?(/vlm|vision|llava|pixtral|qwen.*vl/i)
-            def functions?(_model) = true
+            def functions?(model) = chat?(model)
             def embeddings?(model) = model_id(model).match?(/embed|bge|e5|nomic/i)
+
+            def critical_capabilities_for(model)
+              [
+                ('streaming' if streaming?(model)),
+                ('function_calling' if functions?(model)),
+                ('vision' if vision?(model)),
+                ('embeddings' if embeddings?(model))
+              ].compact
+            end
 
             def model_id(model)
               model.respond_to?(:id) ? model.id.to_s : model.to_s

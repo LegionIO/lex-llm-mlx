@@ -10,6 +10,7 @@ Load it with `require 'legion/extensions/llm/mlx'`.
 
 - `Legion::Extensions::Llm::Mlx::Provider`, registered as `:mlx`.
 - OpenAI-compatible chat, streaming, model listing, and embeddings endpoint wrappers.
+- Heuristic chat, embedding, and vision capability mapping for discovered local models.
 - Local-first defaults for MLX servers running on MacBook, Mac Studio, or local Apple Silicon hosts.
 - Shared Legion settings, JSON, and logging dependencies.
 

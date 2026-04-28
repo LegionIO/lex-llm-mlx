@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 - 2026-04-28
+
+- Require `lex-llm >= 0.1.4` so OpenAI-compatible model discovery exposes normalized capabilities and modalities.
+- Add explicit chat and embedding model capability mapping for MLX routing metadata.
+
 ## 0.1.3 - 2026-04-28
 
 - Remove the leftover compatibility entrypoint outside the Legion namespace.

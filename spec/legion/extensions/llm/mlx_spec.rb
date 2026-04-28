@@ -45,9 +45,39 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     Legion::Extensions::Llm.config.mlx_api_key = original
   end
 
+  it 'maps discovered chat and embedding models to explicit routing metadata' do
+    expect(parsed_models.map(&:capabilities)).to eq([%w[streaming function_calling], %w[embeddings]])
+    expect(parsed_models.map { |model| model.modalities.to_h }).to eq(expected_modalities)
+  end
+
   def chat_payload
     message = Legion::Extensions::Llm::Message.new(role: :user, content: 'hello')
     provider.send(:render_payload, [message], tools: {}, temperature: 0.2, model: model, stream: false,
                                               schema: nil, thinking: nil, tool_prefs: nil)
+  end
+
+  def parsed_models
+    provider.send(:parse_list_models_response, fake_response(models_body), :mlx,
+                  described_class::Provider.capabilities)
+  end
+
+  def expected_modalities
+    [
+      { input: %w[text image], output: %w[text] },
+      { input: %w[text], output: %w[embeddings] }
+    ]
+  end
+
+  def models_body
+    {
+      'data' => [
+        { 'id' => 'mlx-community/Qwen3-14B-4bit', 'created' => 1 },
+        { 'id' => 'mlx-community/nomic-embed-text', 'created' => 2 }
+      ]
+    }
+  end
+
+  def fake_response(body)
+    Struct.new(:body).new(body)
   end
 end
