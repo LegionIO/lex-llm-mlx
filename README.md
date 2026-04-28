@@ -4,6 +4,8 @@ LegionIO LLM provider extension for MLX-backed OpenAI-compatible servers on Appl
 
 This gem lives under `Legion::Extensions::Llm::Mlx` and depends on `lex-llm` for shared provider-neutral routing, fleet, and schema primitives.
 
+Load it with `require 'legion/extensions/llm/mlx'`.
+
 ## What It Provides
 
 - `Legion::Extensions::Llm::Mlx::Provider`, registered as `:mlx`.
