@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.5 - 2026-04-28
+
+- Require current shared Legion JSON, logging, settings, and `lex-llm >= 0.1.5` runtime dependencies.
+
 ## 0.1.4 - 2026-04-28
 
 - Require `lex-llm >= 0.1.4` so OpenAI-compatible model discovery exposes normalized capabilities and modalities.
