@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7 - 2026-04-30
+
+- Add `Legion::Logging::Helper` to `Mlx` module and `RegistryPublisher` for standardized logging.
+- Replace all bare rescue blocks with `handle_exception` calls for full observability.
+- Add info-level action logging for health checks, readiness, model discovery, and registry publishing.
+- Remove custom `log_publish_failure` method in favor of `handle_exception`.
+- Update README to document registry event publishing, transport layer, and architecture.
+
 ## 0.1.6 - 2026-04-28
 
 - Publish best-effort `llm.registry` live readiness and discovered-model availability events using `lex-llm` registry envelopes when transport is already available.

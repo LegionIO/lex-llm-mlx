@@ -11,6 +11,7 @@ module Legion
     module Llm
       # Mlx provider extension namespace.
       module Mlx
+        extend Legion::Logging::Helper
         extend ::Legion::Extensions::Core if ::Legion::Extensions.const_defined?(:Core, false)
 
         PROVIDER_FAMILY = :mlx
@@ -38,3 +39,4 @@ end
 
 Legion::Extensions::Llm::Provider.register(Legion::Extensions::Llm::Mlx::PROVIDER_FAMILY,
                                            Legion::Extensions::Llm::Mlx::Provider)
+Legion::Extensions::Llm::Mlx.log.info('Registered MLX provider as :mlx')

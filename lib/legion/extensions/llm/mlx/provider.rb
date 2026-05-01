@@ -62,17 +62,21 @@ module Legion
           def health_url = '/health'
 
           def health
+            log.info("Checking MLX health at #{api_base}#{health_url}")
             connection.get(health_url).body
           end
 
           def readiness(live: false)
+            log.info("Checking MLX readiness (live=#{live})")
             super.tap do |metadata|
               self.class.registry_publisher.publish_readiness_async(metadata) if live
             end
           end
 
           def list_models
+            log.info('Listing available MLX models')
             super.tap do |models|
+              log.info("Discovered #{Array(models).size} MLX models")
               self.class.registry_publisher.publish_models_async(models, readiness: readiness(live: false))
             end
           end

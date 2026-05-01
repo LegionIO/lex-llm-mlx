@@ -12,7 +12,21 @@ Load it with `require 'legion/extensions/llm/mlx'`.
 - OpenAI-compatible chat, streaming, model listing, and embeddings endpoint wrappers.
 - Heuristic chat, embedding, and vision capability mapping for discovered local models.
 - Local-first defaults for MLX servers running on MacBook, Mac Studio, or local Apple Silicon hosts.
-- Shared Legion settings, JSON, and logging dependencies.
+- Best-effort `llm.registry` event publishing for readiness and model availability when transport is available.
+- Shared Legion settings, JSON, and logging dependencies with full `Legion::Logging::Helper` integration.
+
+## Architecture
+
+```
+Legion::Extensions::Llm::Mlx
+  Mlx (module)             # Extension namespace, provider registration, default settings
+  Provider                 # MLX provider — health, readiness, model listing, OpenAI-compatible adapter
+  RegistryPublisher        # Async publisher for llm.registry readiness/model availability events
+  RegistryEventBuilder     # Builds sanitized lex-llm registry envelopes for MLX provider state
+  Transport::
+    Messages::RegistryEvent  # AMQP message for llm.registry exchange
+    Exchanges::LlmRegistry   # Topic exchange definition for llm.registry
+```
 
 ## Default Settings
 
@@ -41,3 +55,30 @@ end
 - `health_url`: `/health`
 
 The provider uses the shared `Legion::Extensions::Llm::Provider::OpenAICompatible` adapter so Legion routing can treat MLX, vLLM, OpenAI, and other compatible servers consistently while preserving provider-specific settings and health behavior.
+
+## Registry Event Publishing
+
+When `Legion::Transport` and `lex-llm` routing are available, the provider publishes best-effort events to the `llm.registry` topic exchange:
+
+- **Readiness events** — published asynchronously when `readiness(live: true)` is called.
+- **Model availability events** — published asynchronously after `list_models` discovers models.
+
+Publishing is fire-and-forget in background threads; failures never block the provider.
+
+## Dependencies
+
+| Gem | Required | Purpose |
+|-----|----------|---------|
+| `legion-json` (>= 1.2.1) | Yes | JSON serialization |
+| `legion-logging` (>= 1.3.2) | Yes | Structured logging via Helper |
+| `legion-settings` (>= 1.3.14) | Yes | Configuration |
+| `lex-llm` (>= 0.1.5) | Yes | Shared provider base, routing, fleet |
+
+## Development
+
+```bash
+bundle install
+bundle exec rspec       # 0 failures
+bundle exec rubocop -A  # auto-fix
+bundle exec rubocop     # lint check
+```
