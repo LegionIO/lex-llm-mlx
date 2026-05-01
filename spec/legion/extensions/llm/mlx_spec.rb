@@ -5,19 +5,18 @@ require 'spec_helper'
 RSpec.describe Legion::Extensions::Llm::Mlx do
   let(:provider) { described_class::Provider.new(Legion::Extensions::Llm.config) }
   let(:model) { Legion::Extensions::Llm::Model::Info.new(id: 'mlx-community/Qwen3-14B-4bit', provider: :mlx) }
-  let(:registry_publisher) { instance_double(described_class::RegistryPublisher) }
+  let(:registry_publisher) { instance_double(Legion::Extensions::Llm::RegistryPublisher) }
 
-  it 'exposes provider defaults with inherited fleet settings' do
-    settings = described_class.default_settings
-
-    expect(settings[:provider_family]).to eq(:mlx)
-    expect(settings[:fleet]).to include(:enabled)
-    expect(settings.dig(:instances, :default, :endpoint)).to eq('http://localhost:8000')
-    expect(settings.dig(:instances, :default, :usage, :embedding)).to be true
+  it 'exposes flat provider defaults with consumer-facing settings' do
+    expect(described_class.default_settings).to eq(
+      enabled: false, base_url: 'localhost:8000', default_model: nil, api_key: nil,
+      model_whitelist: [], model_blacklist: [], model_cache_ttl: 60,
+      tls: { enabled: false, verify: :peer }, instances: {}
+    )
   end
 
-  it 'registers the Legion::Extensions::Llm provider class' do
-    expect(Legion::Extensions::Llm::Provider.resolve(:mlx)).to eq(described_class::Provider)
+  it 'does not register on the deprecated Provider.register registry' do
+    expect(Legion::Extensions::Llm::Provider.providers[:mlx]).to be_nil
   end
 
   it 'uses the shared OpenAI-compatible provider adapter' do
@@ -47,11 +46,11 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   end
 
   it 'maps discovered chat and embedding models to explicit routing metadata' do
-    expect(parsed_models.map(&:capabilities)).to eq([%w[streaming function_calling], %w[embeddings]])
+    expect(parsed_models.map(&:capabilities)).to eq([%i[streaming function_calling], %i[embeddings]])
     expect(parsed_models.map { |model| model.modalities.to_h }).to eq(expected_modalities)
   end
 
-  it 'publishes live readiness metadata asynchronously through the registry publisher' do
+  it 'publishes live readiness metadata asynchronously through the base registry publisher' do
     allow(described_class::Provider).to receive(:registry_publisher).and_return(registry_publisher)
     allow(provider.connection).to receive(:get).with('/health').and_return(fake_response({}))
     allow(registry_publisher).to receive(:publish_readiness_async)
@@ -61,7 +60,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     expect(registry_publisher).to have_received(:publish_readiness_async).with(readiness)
   end
 
-  it 'publishes discovered models asynchronously through the registry publisher' do
+  it 'publishes discovered models asynchronously through the base registry publisher' do
     stub_registry_publisher
     stub_model_discovery
 
@@ -71,12 +70,21 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       .with(models, readiness: hash_including(provider: :mlx, live: false))
   end
 
-  it 'builds sanitized lex-llm registry events for MLX model availability' do
-    events = capture_registry_events([model], readiness: { ready: true })
+  it 'builds sanitized lex-llm registry events for MLX model availability via base builder' do
+    builder = Legion::Extensions::Llm::RegistryEventBuilder.new(provider_family: :mlx)
+    event = builder.model_available(model, readiness: { ready: true })
 
-    expect(events.first.to_h).to include(event_type: :offering_available)
-    expect(events.first.to_h.dig(:offering, :provider_family)).to eq(:mlx)
-    expect(events.first.to_h.dig(:offering, :model)).to eq('mlx-community/Qwen3-14B-4bit')
+    expect(event.to_h).to include(event_type: :offering_available)
+    expect(event.to_h.dig(:offering, :provider_family)).to eq(:mlx)
+    expect(event.to_h.dig(:offering, :model)).to eq('mlx-community/Qwen3-14B-4bit')
+  end
+
+  it 'creates the registry publisher with the :mlx provider family' do
+    described_class::Provider.registry_publisher = nil
+    pub = described_class::Provider.registry_publisher
+
+    expect(pub).to be_a(Legion::Extensions::Llm::RegistryPublisher)
+    expect(pub.provider_family).to eq(:mlx)
   end
 
   def chat_payload
@@ -117,15 +125,5 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   def stub_registry_publisher
     allow(described_class::Provider).to receive(:registry_publisher).and_return(registry_publisher)
     allow(registry_publisher).to receive(:publish_models_async)
-  end
-
-  def capture_registry_events(models, readiness:)
-    publisher = described_class::RegistryPublisher.new
-    events = []
-    allow(publisher).to receive(:publishing_available?).and_return(true)
-    allow(publisher).to receive(:publish_event) { |event| events << event }
-    allow(Thread).to receive(:new).and_yield
-    publisher.publish_models_async(models, readiness:)
-    events
   end
 end

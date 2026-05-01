@@ -2,8 +2,6 @@
 
 require 'legion/extensions/llm'
 require 'legion/extensions/llm/mlx/provider'
-require 'legion/extensions/llm/mlx/registry_event_builder'
-require 'legion/extensions/llm/mlx/registry_publisher'
 require 'legion/extensions/llm/mlx/version'
 
 module Legion
@@ -17,16 +15,17 @@ module Legion
         PROVIDER_FAMILY = :mlx
 
         def self.default_settings
-          ::Legion::Extensions::Llm.provider_settings(
-            family: PROVIDER_FAMILY,
-            instance: {
-              endpoint: 'http://localhost:8000',
-              tier: :local,
-              transport: :local,
-              usage: { inference: true, embedding: true },
-              limits: { concurrency: 1 }
-            }
-          )
+          {
+            enabled: false,
+            base_url: 'localhost:8000',
+            default_model: nil,
+            api_key: nil,
+            model_whitelist: [],
+            model_blacklist: [],
+            model_cache_ttl: 60,
+            tls: { enabled: false, verify: :peer },
+            instances: {}
+          }
         end
 
         def self.provider_class
@@ -37,6 +36,6 @@ module Legion
   end
 end
 
-Legion::Extensions::Llm::Provider.register(Legion::Extensions::Llm::Mlx::PROVIDER_FAMILY,
-                                           Legion::Extensions::Llm::Mlx::Provider)
-Legion::Extensions::Llm::Mlx.log.info('Registered MLX provider as :mlx')
+Legion::Extensions::Llm::Configuration.register_provider_options(
+  Legion::Extensions::Llm::Mlx::Provider.configuration_options
+)

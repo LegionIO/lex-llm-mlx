@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 - 2026-04-30
+
+- Adopt lex-llm 0.1.9 base contract for RegistryPublisher and RegistryEventBuilder.
+- Remove local `RegistryPublisher` and `RegistryEventBuilder` classes in favor of parameterized base versions.
+- Remove local `transport/` directory (exchange and message classes) in favor of shared lex-llm transport layer.
+- Remove deprecated `Provider.register` call; register configuration options directly.
+- Replace `provider_settings` builder with flat `default_settings` hash matching the new consumer contract.
+- Bump gemspec dependency to `lex-llm >= 0.1.9`.
+
 ## 0.1.7 - 2026-04-30
 
 - Add `Legion::Logging::Helper` to `Mlx` module and `RegistryPublisher` for standardized logging.

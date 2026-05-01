@@ -20,7 +20,7 @@ module Legion
             def capabilities = Capabilities
 
             def registry_publisher
-              @registry_publisher ||= RegistryPublisher.new
+              @registry_publisher ||= Legion::Extensions::Llm::RegistryPublisher.new(provider_family: :mlx)
             end
           end
 
@@ -48,8 +48,12 @@ module Legion
             end
           end
 
+          def settings
+            Mlx.default_settings
+          end
+
           def api_base
-            config.mlx_api_base || 'http://localhost:8000'
+            normalize_url(config.mlx_api_base || 'localhost:8000')
           end
 
           def headers
