@@ -16,7 +16,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   end
 
   it 'does not register on the deprecated Provider.register registry' do
-    expect(Legion::Extensions::Llm::Provider.providers[:mlx]).to be_nil
+    expect(Legion::Extensions::Llm::Provider).not_to respond_to(:providers)
   end
 
   it 'uses the shared OpenAI-compatible provider adapter' do
@@ -85,6 +85,43 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     expect(pub).to be_a(Legion::Extensions::Llm::RegistryPublisher)
     expect(pub.provider_family).to eq(:mlx)
+  end
+
+  describe '.discover_instances' do
+    before do
+      allow(Legion::Extensions::Llm::CredentialSources).to receive_messages(socket_open?: false, setting: nil)
+    end
+
+    it 'returns an empty hash when no local server or settings are available' do
+      expect(described_class.discover_instances).to eq({})
+    end
+
+    it 'discovers a :local instance when port 8080 is reachable' do
+      allow(Legion::Extensions::Llm::CredentialSources).to receive(:socket_open?)
+        .with('localhost', 8080, timeout: 0.1).and_return(true)
+
+      instances = described_class.discover_instances
+
+      expect(instances[:local]).to eq(base_url: 'http://localhost:8080', tier: :local, capabilities: [:completion])
+    end
+
+    it 'discovers named instances from extension settings' do
+      allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
+        .with(:extensions, :llm, :mlx, :instances)
+        .and_return({ gpu1: { base_url: 'http://gpu1:8080' } })
+
+      instances = described_class.discover_instances
+
+      expect(instances[:gpu1]).to include(base_url: 'http://gpu1:8080', tier: :direct)
+    end
+
+    it 'combines local and settings instances' do
+      allow(Legion::Extensions::Llm::CredentialSources).to receive(:socket_open?)
+        .with('localhost', 8080, timeout: 0.1).and_return(true)
+      allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
+        .with(:extensions, :llm, :mlx, :instances).and_return({ remote: { base_url: 'http://remote:8080' } })
+      expect(described_class.discover_instances.keys).to contain_exactly(:local, :remote)
+    end
   end
 
   def chat_payload
