@@ -65,8 +65,4 @@ module Legion
   end
 end
 
-Legion::Extensions::Llm::Configuration.register_provider_options(
-  Legion::Extensions::Llm::Mlx::Provider.configuration_options
-)
-
 Legion::Extensions::Llm::Mlx.register_discovered_instances
