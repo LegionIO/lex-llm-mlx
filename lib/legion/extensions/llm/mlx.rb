@@ -90,5 +90,3 @@ module Legion
     end
   end
 end
-
-Legion::Extensions::Llm::Mlx.register_discovered_instances
