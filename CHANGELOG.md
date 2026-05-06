@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.5 - 2026-05-06
+
+- Load provider-owned fleet actors through the LegionIO subscription base and the canonical MLX provider root.
+- Keep fleet runners anchored on the provider root namespace so provider constants and instance discovery are always loaded.
+- Gate release publishing on the shared security workflow.
+
 ## 0.3.4 - 2026-05-06
 
 - Use the shared `lex-llm` fleet provider responder helper for provider-owned fleet workers.
