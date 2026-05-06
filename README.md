@@ -2,7 +2,7 @@
 
 LegionIO LLM provider extension for MLX-backed OpenAI-compatible servers on Apple Silicon.
 
-This gem lives under `Legion::Extensions::Llm::Mlx` and depends on `lex-llm >= 0.4.1` for shared provider-neutral routing, response normalization, fleet envelopes, and schema primitives.
+This gem lives under `Legion::Extensions::Llm::Mlx` and depends on `lex-llm >= 0.4.3` for shared provider-neutral routing, response normalization, fleet envelopes, fleet responder execution, and schema primitives.
 
 Load it with `require 'legion/extensions/llm/mlx'`.
 
@@ -13,7 +13,7 @@ Load it with `require 'legion/extensions/llm/mlx'`.
 - Heuristic chat, embedding, and vision capability mapping for discovered local models.
 - Local-first defaults for MLX servers running on Apple Silicon hosts.
 - Best-effort `llm.registry` event publishing through shared `lex-llm` registry helpers when transport is available.
-- Provider-owned fleet request actor and runner backed by `legion-llm`.
+- Provider-owned fleet request actor and runner backed by `lex-llm`.
 - Shared Legion settings, JSON, and logging dependencies with full `Legion::Logging::Helper` integration.
 
 ## Architecture
@@ -23,7 +23,7 @@ Legion::Extensions::Llm::Mlx
   Mlx                          # Extension namespace, discovery metadata, default settings
   Provider                     # Health, readiness, model listing, OpenAI-compatible adapter
   Actor::FleetWorker           # Subscription actor enabled by provider instance fleet settings
-  Runners::FleetWorker         # Delegates fleet execution to Legion::LLM::Fleet::ProviderResponder
+  Runners::FleetWorker         # Delegates fleet execution to Legion::Extensions::Llm::Fleet::ProviderResponder
   (shared from lex-llm)
     RegistryPublisher          # Async llm.registry event publishing
     RegistryEventBuilder       # Sanitized registry envelope construction
@@ -125,8 +125,7 @@ Publishing is fire-and-forget in background threads; failures never block the pr
 | `legion-json` (>= 1.2.1) | Yes | JSON serialization |
 | `legion-logging` (>= 1.3.2) | Yes | Structured logging via Helper |
 | `legion-settings` (>= 1.3.14) | Yes | Configuration |
-| `lex-llm` (>= 0.4.1) | Yes | Shared provider base, response normalization, routing, fleet |
-| `legion-llm` (>= 0.9.1) | Yes | Routing and shared fleet worker execution |
+| `lex-llm` (>= 0.4.3) | Yes | Shared provider base, response normalization, routing, fleet envelopes, and fleet responder execution |
 | `legion-transport` (>= 1.4.14) | Yes | AMQP subscriptions and replies |
 
 ## Development
