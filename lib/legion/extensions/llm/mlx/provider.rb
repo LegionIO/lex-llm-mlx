@@ -65,8 +65,8 @@ module Legion
 
           def health_url = '/health'
 
-          def health
-            log.info("Checking MLX health at #{api_base}#{health_url}")
+          def health(live: false)
+            log.info("Checking MLX health live=#{live} at #{api_base}#{health_url}")
             connection.get(health_url).body
           end
 

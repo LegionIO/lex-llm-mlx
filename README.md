@@ -2,7 +2,7 @@
 
 LegionIO LLM provider extension for MLX-backed OpenAI-compatible servers on Apple Silicon.
 
-This gem lives under `Legion::Extensions::Llm::Mlx` and depends on `lex-llm` for shared provider-neutral routing, fleet, and schema primitives.
+This gem lives under `Legion::Extensions::Llm::Mlx` and depends on `lex-llm >= 0.4.0` for shared provider-neutral routing, response normalization, fleet envelopes, and schema primitives.
 
 Load it with `require 'legion/extensions/llm/mlx'`.
 
@@ -47,6 +47,25 @@ end
 
 `mlx_api_key` is optional because most local MLX servers run without authentication. Set it when a proxy or hosted MLX gateway requires bearer authentication.
 
+## Fleet Responder
+
+Provider instances can opt in to consuming Legion LLM fleet requests. The provider-owned fleet actor only starts when at least one configured instance enables `respond_to_requests`.
+
+```yaml
+extensions:
+  llm:
+    mlx:
+      instances:
+        local:
+          fleet:
+            enabled: true
+            respond_to_requests: true
+            capabilities:
+              - chat
+              - stream_chat
+              - embed
+```
+
 ## Endpoint Helpers
 
 - `completion_url` and `stream_url`: `/v1/chat/completions`
@@ -72,7 +91,9 @@ Publishing is fire-and-forget in background threads; failures never block the pr
 | `legion-json` (>= 1.2.1) | Yes | JSON serialization |
 | `legion-logging` (>= 1.3.2) | Yes | Structured logging via Helper |
 | `legion-settings` (>= 1.3.14) | Yes | Configuration |
-| `lex-llm` (>= 0.1.5) | Yes | Shared provider base, routing, fleet |
+| `lex-llm` (>= 0.4.0) | Yes | Shared provider base, response normalization, routing, fleet |
+| `legion-llm` (>= 0.9.0) | Yes | Routing and shared fleet worker execution |
+| `legion-transport` (>= 1.4.14) | Yes | AMQP subscriptions and replies |
 
 ## Development
 
