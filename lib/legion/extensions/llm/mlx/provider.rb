@@ -77,7 +77,7 @@ module Legion
             end
           end
 
-          def list_models
+          def list_models(**)
             log.info('Listing available MLX models')
             super.tap do |models|
               log.info("Discovered #{Array(models).size} MLX models")
