@@ -15,6 +15,8 @@ module Legion
 
             def slug = 'mlx'
             def local? = true
+            def default_transport = :http
+            def default_tier = :local
             def configuration_options = %i[mlx_api_base mlx_api_key]
             def configuration_requirements = []
             def capabilities = Capabilities
@@ -53,14 +55,14 @@ module Legion
           end
 
           def api_base
-            normalize_url(config.mlx_api_base || 'localhost:8000')
+            normalize_url(config.mlx_api_base || settings[:endpoint] || 'http://localhost:8000')
           end
 
           def headers
+            hdrs = identity_headers
             token = config.mlx_api_key
-            return {} if token.nil? || token.to_s.empty?
-
-            { 'Authorization' => "Bearer #{token}" }
+            hdrs['Authorization'] = "Bearer #{token}" unless token.nil? || token.to_s.empty?
+            hdrs
           end
 
           def health_url = '/health'
