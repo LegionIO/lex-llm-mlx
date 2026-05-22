@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.7 - 2026-05-21
+
+- Add `default_transport`/`default_tier` class declarations
+- api_base reads from settings[:endpoint] fallback
+- Identity headers included via base provider
+
+
 ## 0.3.6 - 2026-05-08
 
 - Accept keyword arguments in `list_models` to match the base provider contract called by `discover_offerings`.
