@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.8 - 2026-06-02
+
+- Add per-provider scoped discovery refresh actor
+
 ## 0.3.7 - 2026-05-21
 
 - Add `default_transport`/`default_tier` class declarations
