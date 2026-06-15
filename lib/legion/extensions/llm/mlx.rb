@@ -3,6 +3,7 @@
 require 'legion/extensions/llm'
 require 'legion/extensions/llm/mlx/provider'
 require 'legion/extensions/llm/mlx/version'
+require_relative 'mlx/actors/discovery_refresh'
 
 module Legion
   module Extensions
@@ -28,10 +29,7 @@ module Legion
               fleet: {
                 enabled: false,
                 respond_to_requests: false,
-                capabilities: %i[chat stream_chat embed],
-                lanes: [],
-                concurrency: 1,
-                queue_suffix: nil
+                capabilities: %i[chat stream_chat embed]
               }
             }
           )
@@ -49,10 +47,10 @@ module Legion
         end
 
         def self.discover_local_instance(instances)
-          return unless CredentialSources.socket_open?('localhost', 8080, timeout: 0.1)
+          return unless CredentialSources.socket_open?('localhost', 8000, timeout: 0.1)
 
           instances[:local] = {
-            base_url: 'http://localhost:8080',
+            base_url: 'http://localhost:8000',
             tier: :local,
             capabilities: [:completion]
           }
@@ -84,8 +82,7 @@ module Legion
         private_class_method :discover_local_instance, :discover_settings_instances,
                              :normalize_instance_config, :normalize_api_base
 
-        Legion::Extensions::Llm::Configuration.register_provider_options(Provider.configuration_options) if
-          Legion::Extensions::Llm::Configuration.respond_to?(:register_provider_options)
+        Legion::Extensions::Llm::Configuration.register_provider_options(Provider.configuration_options)
       end
     end
   end
