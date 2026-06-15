@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.10 - 2026-06-15
+
+- **CapabilityPolicy integration** — Name-pattern heuristics tagged as `:provider_catalog`; streaming from `:provider_envelope`. Settings overrides at provider/instance/model level supported.
+
 ## 0.3.9 - 2026-06-13
 
 - **Gemfile cleanup** — Remove local path overrides; dependencies resolve from gemspec via rubygems.

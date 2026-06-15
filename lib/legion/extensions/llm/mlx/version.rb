@@ -4,7 +4,7 @@ module Legion
   module Extensions
     module Llm
       module Mlx
-        VERSION = '0.3.9'
+        VERSION = '0.3.10'
       end
     end
   end
