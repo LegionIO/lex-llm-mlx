@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.11 - 2026-06-16
+
+- Dependency updates and code quality improvements.
+
 ## 0.3.10 - 2026-06-15
 
 - **CapabilityPolicy integration** — Name-pattern heuristics tagged as `:provider_catalog`; streaming from `:provider_envelope`. Settings overrides at provider/instance/model level supported.
