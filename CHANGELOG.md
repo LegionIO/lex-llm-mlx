@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.13] - 2026-06-20
+
+### Changed
+- Align MLX offerings to the current `lex-llm` contract: `discover_offerings` now works with the shared
+  provider flow, offerings honor configured tier/transport overrides, and provider health is carried onto
+  discovered offerings in the shared shape.
+- Normalize MLX capability override expectations to the shared `:embedding` offering vocabulary.
+
 ## [0.3.12] - 2026-06-19
 
 ### Changed

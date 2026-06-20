@@ -69,7 +69,19 @@ module Legion
 
           def health(live: false)
             log.info("Checking MLX health live=#{live} at #{api_base}#{health_url}")
-            connection.get(health_url).body
+            raw = connection.get(health_url).body
+            health_payload(raw)
+          rescue StandardError => e
+            handle_exception(e, level: :warn, handled: true, operation: 'mlx.provider.health')
+            {
+              provider: :mlx,
+              instance_id: provider_instance_id,
+              status: 'unhealthy',
+              ready: false,
+              circuit_state: 'open',
+              error: e.class.name,
+              message: e.message
+            }
           end
 
           def readiness(live: false)
@@ -87,31 +99,15 @@ module Legion
             end
           end
 
-          def discover_offerings(live: false, **)
-            models = if live
-                       @cached_models = list_models
-                     else
-                       Array(@cached_models)
-                     end
-            offerings = models.filter_map { |model_info| offering_from_model(model_info) }
-            log.debug { "[llm][mlx] discover_offerings action=built count=#{offerings.size} live=#{live}" }
-            offerings
-          rescue StandardError => e
-            handle_exception(e, level: :warn, handled: true, operation: 'mlx.discover_offerings')
-            []
-          end
-
-          private
-
-          def offering_from_model(model_info) # rubocop:disable Metrics/AbcSize
+          def offering_from_model(model_info, health: {}) # rubocop:disable Metrics/AbcSize
             policy = resolve_capability_policy(model_info)
             ctx = model_info.respond_to?(:context_length) ? model_info.context_length : nil
 
             Legion::Extensions::Llm::Routing::ModelOffering.new(
               provider_family: :mlx,
               instance_id: config.respond_to?(:instance_id) ? config.instance_id : :default,
-              transport: :http,
-              tier: :local,
+              transport: offering_transport,
+              tier: offering_tier,
               model: model_info.id,
               canonical_model_alias: model_info.respond_to?(:name) ? model_info.name : nil,
               model_family: model_info.respond_to?(:family) ? model_info.family : nil,
@@ -119,6 +115,7 @@ module Legion
               capabilities: policy[:capabilities],
               capability_sources: policy[:sources],
               limits: { context_window: ctx }.compact,
+              health: health,
               metadata: offering_metadata_for(model_info).merge(capability_sources: policy[:sources])
             )
           end
@@ -160,6 +157,32 @@ module Legion
 
           def provider_envelope_capabilities
             { streaming: true }
+          end
+
+          def health_payload(raw)
+            ready = health_ready?(raw)
+            status = health_status(ready)
+
+            {
+              provider: :mlx,
+              instance_id: provider_instance_id,
+              status: status,
+              ready: ready,
+              circuit_state: circuit_state(status),
+              raw: raw
+            }
+          end
+
+          def health_ready?(raw)
+            raw.is_a?(Hash) ? raw.fetch('ready', raw.fetch(:ready, true)) : true
+          end
+
+          def health_status(ready)
+            ready ? 'healthy' : 'unhealthy'
+          end
+
+          def circuit_state(status)
+            status == 'healthy' ? 'closed' : 'open'
           end
 
           def provider_capability_config

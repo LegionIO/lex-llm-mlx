@@ -72,10 +72,26 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Provider do # rubocop:disable RSpec
 
       offering = configured.send(:offering_from_model, bare_model)
 
-      expect(offering.capabilities).to include(:embeddings)
+      expect(offering.capabilities).to include(:embedding)
       expect(offering.capabilities).not_to include(:tools)
-      expect(offering.capability_sources[:embeddings]).to eq({ value: true, source: :model_override })
+      expect(offering.capability_sources[:embedding]).to eq({ value: true, source: :model_override })
       expect(offering.capability_sources[:tools]).to eq({ value: false, source: :model_override })
+    end
+  end
+
+  describe 'shared offering contract' do
+    let(:configured_with_tier) do
+      described_class.new(
+        mlx_api_base: 'http://localhost:8000',
+        tier: :direct
+      )
+    end
+
+    it 'honors tier overrides and carries provider health onto offerings' do
+      offering = configured_with_tier.send(:offering_from_model, bare_model, health: { status: 'healthy', ready: true })
+
+      expect(offering.tier).to eq(:direct)
+      expect(offering.health).to eq({ status: 'healthy', ready: true })
     end
   end
 end
