@@ -88,14 +88,25 @@ module Legion
 
             def lanes_for_instance(entry)
               adapter     = entry[:adapter]
-              instance_id = entry[:instance]
+              instance_id = entry[:instance] || entry[:instance_id] || entry[:id]
               return [] unless adapter.respond_to?(:discover_offerings)
 
-              offerings_for(adapter, instance_id).filter_map do |offering|
-                next if offering.nil?
+              offerings_for(adapter, instance_id).filter_map do |raw_offering|
+                offering = offering_to_hash(raw_offering)
+                next unless offering
 
                 build_lanes(offering, instance_id)
               end.flatten
+            end
+
+            def offering_to_hash(offering)
+              return nil if offering.nil?
+              return offering if offering.is_a?(Hash)
+
+              hash = offering.to_h
+              hash[:type] ||= hash[:usage_type]
+              hash[:enabled] = offering.respond_to?(:enabled?) ? offering.enabled? : true
+              hash
             end
 
             def build_lanes(offering, instance_id)
