@@ -65,7 +65,6 @@ module Legion
 
             def manual(**)
               tick if respond_to?(:tick)
-              refresh_discovered_models!
             rescue StandardError => e
               handle_exception(e, level: :warn, handled: true, operation: 'mlx.actor.discovery_refresh')
             end
@@ -153,29 +152,6 @@ module Legion
             def fleet_enabled?
               mlx_settings = Legion::Settings.dig(:extensions, :llm, :mlx) || {}
               mlx_settings.dig(:fleet, :dispatch, :enabled)
-            end
-
-            def refresh_discovered_models!
-              log.debug('[mlx][discovery_refresh] refreshing model list')
-              return unless defined?(Legion::LLM::Discovery)
-
-              Legion::LLM::Discovery.refresh_discovered_models!(provider: :mlx)
-              populate_auto_rules!
-              invalidate_offerings_cache!
-            end
-
-            def populate_auto_rules!
-              return unless defined?(Legion::LLM::Router)
-              return unless Legion::LLM::Router.respond_to?(:populate_auto_rules)
-
-              Legion::LLM::Router.populate_auto_rules(Legion::LLM::Discovery.discovered_instances)
-            end
-
-            def invalidate_offerings_cache!
-              return unless defined?(Legion::LLM::Inventory)
-              return unless Legion::LLM::Inventory.respond_to?(:invalidate_offerings_cache!)
-
-              Legion::LLM::Inventory.invalidate_offerings_cache!
             end
           end
         end
