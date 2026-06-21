@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.3.13] - 2026-06-20
+
+### Changed
+- Align MLX offerings to the current `lex-llm` contract: `discover_offerings` now works with the shared
+  provider flow, offerings honor configured tier/transport overrides, and provider health is carried onto
+  discovered offerings in the shared shape.
+- Normalize MLX capability override expectations to the shared `:embedding` offering vocabulary.
+
+## [0.3.12] - 2026-06-19
+
+### Changed
+- Adopt `Legion::Extensions::Llm::Inventory::ScopedRefresher` mixin (lex-llm 0.6.0). Discovery
+  refresh actors now write directly to the live `Inventory` catalog via `Inventory.write_lane`.
+- Pin `lex-llm >= 0.6.0` and `legion-llm >= 0.14.0` in gemspec.
+- Standard `weight: 100` default added to provider instance settings schema.
+
+## 0.3.11 - 2026-06-16
+
+- Dependency updates and code quality improvements.
+
+## 0.3.10 - 2026-06-15
+
+- **CapabilityPolicy integration** — Name-pattern heuristics tagged as `:provider_catalog`; streaming from `:provider_envelope`. Settings overrides at provider/instance/model level supported.
+
+## 0.3.9 - 2026-06-13
+
+- **Gemfile cleanup** — Remove local path overrides; dependencies resolve from gemspec via rubygems.
+- **Dependency bump** — Require `lex-llm >= 0.5.0` for canonical types support.
+- **Canonical tool support** — Use `ToolSchema.extract` and add `:tools` capability.
+- 20 examples, 0 failures; 13 files, 0 rubocop offenses.
+
 ## 0.3.8 - 2026-06-02
 
 - Add per-provider scoped discovery refresh actor

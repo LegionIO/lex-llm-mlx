@@ -51,7 +51,9 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   end
 
   it 'maps discovered chat and embedding models to explicit routing metadata' do
-    expect(parsed_models.map(&:capabilities)).to eq([%i[streaming function_calling tools], %i[embeddings]])
+    normalized = parsed_models.map { |parsed_model| Legion::Extensions::Llm::Capabilities.normalize(parsed_model.capabilities) }
+
+    expect(normalized).to eq([%i[streaming tools], %i[embedding]])
     expect(parsed_models.map { |model| model.modalities.to_h }).to eq(expected_modalities)
   end
 
@@ -101,13 +103,13 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       expect(described_class.discover_instances).to eq({})
     end
 
-    it 'discovers a :local instance when port 8080 is reachable' do
+    it 'discovers a :local instance when port 8000 is reachable' do
       allow(Legion::Extensions::Llm::CredentialSources).to receive(:socket_open?)
-        .with('localhost', 8080, timeout: 0.1).and_return(true)
+        .with('localhost', 8000, timeout: 0.1).and_return(true)
 
       instances = described_class.discover_instances
 
-      expect(instances[:local]).to eq(base_url: 'http://localhost:8080', tier: :local, capabilities: [:completion])
+      expect(instances[:local]).to eq(base_url: 'http://localhost:8000', tier: :local, capabilities: [:completion])
     end
 
     it 'discovers named instances from extension settings' do # rubocop:disable RSpec/ExampleLength
@@ -135,7 +137,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     it 'combines local and settings instances' do
       allow(Legion::Extensions::Llm::CredentialSources).to receive(:socket_open?)
-        .with('localhost', 8080, timeout: 0.1).and_return(true)
+        .with('localhost', 8000, timeout: 0.1).and_return(true)
       allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
         .with(:extensions, :llm, :mlx, :instances).and_return({ remote: { base_url: 'http://remote:8080' } })
       expect(described_class.discover_instances.keys).to contain_exactly(:local, :remote)
