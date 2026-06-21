@@ -51,7 +51,9 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   end
 
   it 'maps discovered chat and embedding models to explicit routing metadata' do
-    expect(parsed_models.map(&:capabilities)).to eq([%i[streaming tools], %i[embedding]])
+    normalized = parsed_models.map { |parsed_model| Legion::Extensions::Llm::Capabilities.normalize(parsed_model.capabilities) }
+
+    expect(normalized).to eq([%i[streaming tools], %i[embedding]])
     expect(parsed_models.map { |model| model.modalities.to_h }).to eq(expected_modalities)
   end
 
