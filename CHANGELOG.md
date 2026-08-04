@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.14] - 2026-08-04
+
+### Changed
+- Prepare the MLX provider standardization baseline for a patch release.
+
 ## [0.3.13] - 2026-06-20
 
 ### Changed
