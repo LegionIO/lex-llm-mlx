@@ -305,15 +305,14 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     it 'reproduces the same instance_id across multiple calls (stable identity)' do
       config = ssot_harness.instance_configs.first
-      id_a = ssot_harness.instance_id(instance_config: config)
-      id_b = ssot_harness.instance_id(instance_config: config)
-      expect(id_a).to eq(id_b)
+      first_call = ssot_harness.instance_id(instance_config: config)
+      second_call = ssot_harness.instance_id(instance_config: config)
+      expect(first_call).to eq(second_call)
     end
 
     it 'strips /v1 suffix from endpoint when computing identity' do
       config_with_v1 = { mlx_api_base: 'http://mac-studio-1.local:8000/v1' }
       config_without = { mlx_api_base: 'http://mac-studio-1.local:8000' }
-      # Both should produce same host:port identity
       expect(URI.parse(config_with_v1[:mlx_api_base]).host).to eq(URI.parse(config_without[:mlx_api_base]).host)
       expect(URI.parse(config_with_v1[:mlx_api_base]).port).to eq(URI.parse(config_without[:mlx_api_base]).port)
     end
@@ -343,36 +342,36 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       { publisher: publisher, key: key, callable: callable, token: token, drafts: drafts, coordinator: coordinator }
     end
 
-    it 'creates separate lanes for the same model on different instances' do
-      a = bring_up_instance(ssot_harness.instance_configs[0])
-      b = bring_up_instance(ssot_harness.instance_configs[1])
+    context 'with both instances active' do
+      let(:instance_a) { bring_up_instance(ssot_harness.instance_configs[0]) }
+      let(:instance_b) { bring_up_instance(ssot_harness.instance_configs[1]) }
+      let(:snapshot) { instance_a && instance_b && registry.snapshot }
+      let(:lanes_a) { snapshot.lanes_for(instance_key: instance_a[:key]) }
+      let(:lanes_b) { snapshot.lanes_for(instance_key: instance_b[:key]) }
 
-      snapshot = registry.snapshot
-      lanes_a = snapshot.lanes_for(instance_key: a[:key])
-      lanes_b = snapshot.lanes_for(instance_key: b[:key])
+      it 'creates non-empty lanes for instance A' do
+        expect(lanes_a).not_to be_empty
+      end
 
-      expect(lanes_a).not_to be_empty
-      expect(lanes_b).not_to be_empty
+      it 'creates non-empty lanes for instance B' do
+        expect(lanes_b).not_to be_empty
+      end
 
-      lane_ids_a = lanes_a.map(&:lane_id)
-      lane_ids_b = lanes_b.map(&:lane_id)
-      expect(lane_ids_a & lane_ids_b).to be_empty
+      it 'assigns distinct lane_ids across different instances' do
+        expect(lanes_a.map(&:lane_id) & lanes_b.map(&:lane_id)).to be_empty
+      end
+    end
+
+    def offering_id_after_bring_up(config)
+      result = bring_up_instance(config)
+      registry.snapshot.offerings_for(instance_key: result[:key]).first.offering_id
     end
 
     it 'reproduces IDs after restart (identity is deterministic from inputs)' do
       config = ssot_harness.instance_configs[0]
-      first_run = bring_up_instance(config)
-      first_offering_id = registry.snapshot.offerings_for(instance_key: first_run[:key]).first.offering_id
-      first_lane_id = registry.snapshot.lanes_for(instance_key: first_run[:key]).first.lane_id
-
-      # Simulate restart: reset and re-register
+      first_id = offering_id_after_bring_up(config)
       registry.reset!
-      second_run = bring_up_instance(config)
-      second_offering_id = registry.snapshot.offerings_for(instance_key: second_run[:key]).first.offering_id
-      second_lane_id = registry.snapshot.lanes_for(instance_key: second_run[:key]).first.lane_id
-
-      expect(second_offering_id).to eq(first_offering_id)
-      expect(second_lane_id).to eq(first_lane_id)
+      expect(offering_id_after_bring_up(config)).to eq(first_id)
     end
   end
 
@@ -400,52 +399,69 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       { publisher: publisher, key: key, callable: callable, token: token, drafts: drafts }
     end
 
-    it 'preserves offering_id and lane_id when tier changes from local to frontier' do
-      config = ssot_harness.instance_configs[0]
-      context = bring_up_with_tier(config, tier: :local)
-
-      before_offering = registry.snapshot.offerings_for(instance_key: context[:key]).first
-      before_lane = registry.snapshot.lanes_for(instance_key: context[:key]).first
-
-      # Republish with different tier
-      frontier_drafts = ssot_harness.build_offering_drafts(
-        instance_config: config, callable: context[:callable], tier: :frontier
-      )
+    def republish_with_tier(context, config, tier:)
+      frontier_drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: context[:callable],
+                                                           tier: tier)
       context[:publisher].replace_instance_snapshot(
         instance_id: ssot_harness.instance_id(instance_config: config),
-        publisher_token: context[:token],
-        offerings: frontier_drafts,
-        sequence: 1
+        publisher_token: context[:token], offerings: frontier_drafts, sequence: 1
       )
+    end
 
-      after_offering = registry.snapshot.offerings_for(instance_key: context[:key]).first
-      after_lane = registry.snapshot.lanes_for(instance_key: context[:key]).first
+    it 'preserves offering_id when tier changes from local to frontier' do
+      config = ssot_harness.instance_configs[0]
+      context = bring_up_with_tier(config, tier: :local)
+      before_id = registry.snapshot.offerings_for(instance_key: context[:key]).first.offering_id
+      republish_with_tier(context, config, tier: :frontier)
+      expect(registry.snapshot.offerings_for(instance_key: context[:key]).first.offering_id).to eq(before_id)
+    end
 
-      expect(after_offering.offering_id).to eq(before_offering.offering_id)
-      expect(after_lane.lane_id).to eq(before_lane.lane_id)
-      expect(after_offering.tier).to eq(:frontier)
+    it 'preserves lane_id when tier changes from local to frontier' do
+      config = ssot_harness.instance_configs[0]
+      context = bring_up_with_tier(config, tier: :local)
+      before_lane_id = registry.snapshot.lanes_for(instance_key: context[:key]).first.lane_id
+      republish_with_tier(context, config, tier: :frontier)
+      expect(registry.snapshot.lanes_for(instance_key: context[:key]).first.lane_id).to eq(before_lane_id)
+    end
+
+    it 'updates the tier value after republication' do
+      config = ssot_harness.instance_configs[0]
+      context = bring_up_with_tier(config, tier: :local)
+      republish_with_tier(context, config, tier: :frontier)
+      expect(registry.snapshot.offerings_for(instance_key: context[:key]).first.tier).to eq(:frontier)
     end
   end
 
   # --- Embedding operation evidence --------------------------------------------
 
   describe 'embedding operation support detection' do
-    it 'marks chat models as supporting chat/stream_chat but not embed' do
-      config = ssot_harness.instance_configs[0]
-      callable = ssot_harness.build_callable(instance_config: config)
-      drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: callable, tier: :local)
-      offering = drafts.first
+    let(:config) { ssot_harness.instance_configs[0] }
+    let(:callable) { ssot_harness.build_callable(instance_config: config) }
+    let(:drafts) { ssot_harness.build_offering_drafts(instance_config: config, callable: callable, tier: :local) }
+    let(:offering) { drafts.first }
 
+    it 'marks chat models as supporting chat' do
       expect(offering.operation_evidence[:chat].status).to eq(:supported)
+    end
+
+    it 'marks chat models as supporting stream_chat' do
       expect(offering.operation_evidence[:stream_chat].status).to eq(:supported)
+    end
+
+    it 'marks chat models as not supporting embed' do
       expect(offering.operation_evidence[:embed].status).to eq(:unsupported)
     end
 
-    it 'detects embedding models by name pattern' do
-      # The embedding pattern check is model-name based
-      expect('BAAI/bge-large-en-v1.5').to match(/embed|bge|e5|nomic/i)
-      expect('nomic-ai/nomic-embed-text-v1.5').to match(/embed|bge|e5|nomic/i)
-      expect('mlx-community/Llama-3.2-3B-Instruct-4bit').not_to match(/embed|bge|e5|nomic/i)
+    it 'matches known embedding model names against the embedding pattern' do
+      pattern = MlxSsotEvidenceHelpers::EMBEDDING_PATTERN
+      expect(pattern).to match('BAAI/bge-large-en-v1.5')
+      expect(pattern).to match('nomic-ai/nomic-embed-text-v1.5')
+    end
+
+    it 'does not match chat model names against the embedding pattern' do
+      pattern = MlxSsotEvidenceHelpers::EMBEDDING_PATTERN
+      chat_model = 'mlx-community/Llama-3.2-3B-Instruct-4bit'
+      expect(chat_model).not_to match(pattern)
     end
   end
 
@@ -512,33 +528,42 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     it 'remains initializing until readiness probe succeeds' do
       publisher.claim_instance(instance_id: instance_id, callable: callable, probe_request_handle: coordinator)
-
-      snapshot = registry.snapshot
-      expect(snapshot.instance(instance_key: key)).to be_nil
-      expect(snapshot.publication_status(instance_key: key).state).to eq(:initializing)
+      expect(registry.snapshot.instance(instance_key: key)).to be_nil
+      expect(registry.snapshot.publication_status(instance_key: key).state).to eq(:initializing)
     end
 
-    it 'stays initializing after an initial readiness failure' do
-      token = publisher.claim_instance(instance_id: instance_id, callable: callable, probe_request_handle: coordinator)
-      probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
-      publisher.readiness_failed(instance_id: instance_id, probe_token: probe, reason: 'MLX /health connection failed')
+    context 'when initial readiness fails' do
+      let(:token) do
+        publisher.claim_instance(instance_id: instance_id, callable: callable, probe_request_handle: coordinator)
+      end
+      let(:probe) { publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token) }
 
-      snapshot = registry.snapshot
-      expect(snapshot.instance(instance_key: key)).to be_nil
-      expect(snapshot.publication_status(instance_key: key).state).to eq(:initializing)
+      before { publisher.readiness_failed(instance_id: instance_id, probe_token: probe, reason: 'MLX /health failed') }
+
+      it 'stays initializing after failure' do
+        expect(registry.snapshot.instance(instance_key: key)).to be_nil
+        expect(registry.snapshot.publication_status(instance_key: key).state).to eq(:initializing)
+      end
     end
 
-    it 'transitions to available after readiness success' do
-      token = publisher.claim_instance(instance_id: instance_id, callable: callable, probe_request_handle: coordinator)
-      probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
-      drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: callable, tier: :local)
-      publisher.activate_instance_snapshot(
-        instance_id: instance_id, publisher_token: token, offerings: drafts, sequence: 0, probe_token: probe
-      )
+    context 'when readiness succeeds with offerings' do
+      before do
+        token = publisher.claim_instance(instance_id: instance_id, callable: callable,
+                                         probe_request_handle: coordinator)
+        probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
+        drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: callable, tier: :local)
+        publisher.activate_instance_snapshot(
+          instance_id: instance_id, publisher_token: token, offerings: drafts, sequence: 0, probe_token: probe
+        )
+      end
 
-      snapshot = registry.snapshot
-      expect(snapshot.instance(instance_key: key).availability.state).to eq(:available)
-      expect(snapshot.publication_status(instance_key: key).state).to eq(:complete)
+      it 'transitions to available' do
+        expect(registry.snapshot.instance(instance_key: key).availability.state).to eq(:available)
+      end
+
+      it 'reports publication status as complete' do
+        expect(registry.snapshot.publication_status(instance_key: key).state).to eq(:complete)
+      end
     end
   end
 
@@ -570,33 +595,37 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       token
     end
 
-    it 'rejects a stale probe started before a newer one that reported failure' do
+    def setup_stale_probe_scenario
       token = activate_instance
-
       stale_probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
       fresh_probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
-
-      # Fresh probe fails -> instance becomes unavailable
       publisher.readiness_failed(instance_id: instance_id, probe_token: fresh_probe, reason: 'server down')
+      [token, stale_probe]
+    end
 
-      # Stale probe tries to succeed -> should be rejected
+    it 'rejects a stale probe started before a newer failure' do
+      _token, stale_probe = setup_stale_probe_scenario
       result = publisher.readiness_succeeded(instance_id: instance_id, probe_token: stale_probe)
       expect(result.applied).to be(false)
+    end
+
+    it 'reports stale reason on rejected probe' do
+      _token, stale_probe = setup_stale_probe_scenario
+      result = publisher.readiness_succeeded(instance_id: instance_id, probe_token: stale_probe)
       expect(result.reason).to eq(:stale_probe)
+    end
+
+    def mark_unavailable_and_recover(token)
+      registry.dispatch_instance_unavailable(
+        instance_key: key, publisher_token_id: token.publisher_token_id, reason: 'connection refused'
+      )
+      new_probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
+      publisher.readiness_succeeded(instance_id: instance_id, probe_token: new_probe)
     end
 
     it 'recovers an unavailable instance after a valid probe succeeds' do
       token = activate_instance
-
-      # Mark unavailable via dispatch
-      registry.dispatch_instance_unavailable(
-        instance_key: key, publisher_token_id: token.publisher_token_id, reason: 'connection refused'
-      )
-      expect(registry.snapshot.instance(instance_key: key).availability.state).to eq(:unavailable)
-
-      # New probe succeeds -> should recover
-      new_probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
-      publisher.readiness_succeeded(instance_id: instance_id, probe_token: new_probe)
+      mark_unavailable_and_recover(token)
       expect(registry.snapshot.instance(instance_key: key).availability.state).to eq(:available)
     end
   end
@@ -625,19 +654,25 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       { publisher: publisher, key: key, callable: callable, token: token }
     end
 
-    it 'marks only one instance unavailable without affecting the other' do
-      a = bring_up(ssot_harness.instance_configs[0])
-      b = bring_up(ssot_harness.instance_configs[1])
+    context 'with two active instances and instance A marked unavailable' do
+      let(:instance_a) { bring_up(ssot_harness.instance_configs[0]) }
+      let(:instance_b) { bring_up(ssot_harness.instance_configs[1]) }
 
-      # Instance A goes down
-      registry.dispatch_instance_unavailable(
-        instance_key: a[:key],
-        publisher_token_id: a[:token].publisher_token_id,
-        reason: 'connection refused to mac-studio-1'
-      )
+      before do
+        instance_a && instance_b
+        registry.dispatch_instance_unavailable(
+          instance_key: instance_a[:key],
+          publisher_token_id: instance_a[:token].publisher_token_id, reason: 'connection refused'
+        )
+      end
 
-      expect(registry.snapshot.instance(instance_key: a[:key]).availability.state).to eq(:unavailable)
-      expect(registry.snapshot.instance(instance_key: b[:key]).availability.state).to eq(:available)
+      it 'marks instance A as unavailable' do
+        expect(registry.snapshot.instance(instance_key: instance_a[:key]).availability.state).to eq(:unavailable)
+      end
+
+      it 'keeps instance B available' do
+        expect(registry.snapshot.instance(instance_key: instance_b[:key]).availability.state).to eq(:available)
+      end
     end
 
     it 'normalizes connection failure as instance_unavailable through the harness' do
@@ -674,49 +709,49 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       )
     end
 
-    it 'coalesces multiple probe requests into a single in-flight probe' do
-      # First request gets enqueued
+    def enqueue_and_begin_probe(revision:)
       coordinator.enqueue_probe_request(
         instance_key: key, publisher_token_id: 'ptok:v1:aaa',
-        unavailable_revision: 1, reason: 'first failure'
+        unavailable_revision: revision, reason: "rev #{revision}"
       )
-      expect(enqueue_calls.size).to eq(1)
+      coordinator.begin_probe(request: enqueue_calls.first) if enqueue_calls.size == 1
+    end
 
-      # Start the probe
-      expect(coordinator.begin_probe(request: enqueue_calls.first)).to be(true)
+    def enqueue_additional(revision:, reason: "rev #{revision}")
+      coordinator.enqueue_probe_request(
+        instance_key: key, publisher_token_id: 'ptok:v1:aaa',
+        unavailable_revision: revision, reason: reason
+      )
+    end
+
+    it 'enqueues the first probe request immediately' do
+      enqueue_and_begin_probe(revision: 1)
+      expect(enqueue_calls.size).to eq(1)
+    end
+
+    it 'marks coordinator as in-flight after begin' do
+      enqueue_and_begin_probe(revision: 1)
       expect(coordinator.in_flight?).to be(true)
+    end
 
-      # Second request arrives while probe is in flight - should NOT re-enqueue
-      coordinator.enqueue_probe_request(
-        instance_key: key, publisher_token_id: 'ptok:v1:aaa',
-        unavailable_revision: 2, reason: 'second failure'
-      )
-      # Still only 1 enqueue call (the second is pending, not enqueued)
+    it 'does not re-enqueue while probe is in-flight' do
+      enqueue_and_begin_probe(revision: 1)
+      enqueue_additional(revision: 2, reason: 'second failure')
       expect(enqueue_calls.size).to eq(1)
+    end
 
-      # Finish probe -> pending request should now be enqueued
+    it 'enqueues pending request after finish' do
+      enqueue_and_begin_probe(revision: 1)
+      enqueue_additional(revision: 2, reason: 'second failure')
       coordinator.finish_probe(request: enqueue_calls.first)
       expect(enqueue_calls.size).to eq(2)
       expect(enqueue_calls.last.unavailable_revision).to eq(2)
     end
 
     it 'only retains the highest unavailable_revision when coalescing' do
-      coordinator.enqueue_probe_request(
-        instance_key: key, publisher_token_id: 'ptok:v1:aaa',
-        unavailable_revision: 1, reason: 'rev 1'
-      )
-      expect(coordinator.begin_probe(request: enqueue_calls.first)).to be(true)
-
-      # Multiple requests while in-flight, only highest revision retained
-      coordinator.enqueue_probe_request(
-        instance_key: key, publisher_token_id: 'ptok:v1:aaa',
-        unavailable_revision: 3, reason: 'rev 3'
-      )
-      coordinator.enqueue_probe_request(
-        instance_key: key, publisher_token_id: 'ptok:v1:aaa',
-        unavailable_revision: 2, reason: 'rev 2'
-      )
-
+      enqueue_and_begin_probe(revision: 1)
+      enqueue_additional(revision: 3)
+      enqueue_additional(revision: 2)
       coordinator.finish_probe(request: enqueue_calls.first)
       expect(enqueue_calls.last.unavailable_revision).to eq(3)
     end
@@ -725,79 +760,64 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   # --- Connection refusal/timeout/generic don't globally poison ----------------
 
   describe 'error isolation (no global poisoning)' do
+    let(:callable) { ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0]) }
+
     it 'classifies connection failure as connection_failure on the callable' do
-      callable = ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0])
       error = Faraday::ConnectionFailed.new('Connection refused')
-      outcome = callable.normalize_dispatch_error(error: error)
-      expect(outcome.kind).to eq(:connection_failure)
+      expect(callable.normalize_dispatch_error(error: error).kind).to eq(:connection_failure)
     end
 
     it 'classifies timeout as timeout on the callable' do
-      callable = ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0])
       error = Faraday::TimeoutError.new('Net::ReadTimeout')
-      outcome = callable.normalize_dispatch_error(error: error)
-      expect(outcome.kind).to eq(:timeout)
+      expect(callable.normalize_dispatch_error(error: error).kind).to eq(:timeout)
     end
 
     it 'classifies generic errors as provider_error on the callable' do
-      callable = ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0])
       error = RuntimeError.new('unexpected failure')
-      outcome = callable.normalize_dispatch_error(error: error)
-      expect(outcome.kind).to eq(:provider_error)
+      expect(callable.normalize_dispatch_error(error: error).kind).to eq(:provider_error)
     end
 
     it 'classifies 503 ServerError as overloaded on the callable' do
-      callable = ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0])
       response = { status: 503, headers: {}, body: '' }
       error = Faraday::ServerError.new('503', response)
-      outcome = callable.normalize_dispatch_error(error: error)
-      expect(outcome.kind).to eq(:overloaded)
+      expect(callable.normalize_dispatch_error(error: error).kind).to eq(:overloaded)
     end
 
     it 'classifies 429 ClientError as rate_limited on the callable' do
-      callable = ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0])
       response = { status: 429, headers: {}, body: '' }
       error = Faraday::ClientError.new('429', response)
-      outcome = callable.normalize_dispatch_error(error: error)
-      expect(outcome.kind).to eq(:rate_limited)
+      expect(callable.normalize_dispatch_error(error: error).kind).to eq(:rate_limited)
     end
 
     it 'classifies 401 as authentication on the callable' do
-      callable = ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0])
       response = { status: 401, headers: {}, body: '' }
       error = Faraday::ClientError.new('401', response)
-      outcome = callable.normalize_dispatch_error(error: error)
-      expect(outcome.kind).to eq(:authentication)
+      expect(callable.normalize_dispatch_error(error: error).kind).to eq(:authentication)
     end
 
     it 'classifies 404 as model_missing on the callable' do
-      callable = ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0])
       response = { status: 404, headers: {}, body: '' }
       error = Faraday::ClientError.new('404', response)
-      outcome = callable.normalize_dispatch_error(error: error)
-      expect(outcome.kind).to eq(:model_missing)
+      expect(callable.normalize_dispatch_error(error: error).kind).to eq(:model_missing)
     end
 
     it 'never returns instance_unavailable from the callable for any server error' do
-      callable = ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0])
-      [500, 502, 503, 504, 529].each do |status|
-        response = { status: status, headers: {}, body: '' }
-        error = Faraday::ServerError.new(status.to_s, response)
-        outcome = callable.normalize_dispatch_error(error: error)
-        expect(outcome.kind).not_to eq(:instance_unavailable),
-                                    "status #{status} should not map to instance_unavailable"
+      results = [500, 502, 503, 504, 529].map do |s|
+        error = Faraday::ServerError.new(s.to_s, { status: s, headers: {}, body: '' })
+        [s, callable.normalize_dispatch_error(error: error).kind]
       end
+      results.each { |s, kind| expect(kind).not_to eq(:instance_unavailable), "status #{s}" }
     end
   end
 
   # --- No quota domain broadening without authoritative scope ------------------
 
   describe 'quota domain safety' do
-    it 'does not declare quota_domains on offerings' do
-      config = ssot_harness.instance_configs[0]
-      callable = ssot_harness.build_callable(instance_config: config)
-      drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: callable, tier: :local)
+    let(:config) { ssot_harness.instance_configs[0] }
+    let(:callable) { ssot_harness.build_callable(instance_config: config) }
+    let(:drafts) { ssot_harness.build_offering_drafts(instance_config: config, callable: callable, tier: :local) }
 
+    it 'does not declare quota_domains on offerings' do
       drafts.each do |draft|
         expect(draft.quota_domains).to be_empty,
                                        'MLX offerings must not declare quota_domains without authoritative scope'
@@ -837,6 +857,14 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       token
     end
 
+    def build_envelope(offering_id:, model:, operation: 'chat', params: { messages: [] })
+      {
+        execution_contract: Legion::Extensions::Llm::Fleet::Protocol::EXACT_EXECUTION_CONTRACT,
+        offering_id: offering_id, provider: 'mlx', provider_instance: instance_id,
+        model: model, operation: operation, params: params
+      }
+    end
+
     before do
       allow(Legion::Extensions::Llm::Fleet::WorkerExecution).to receive_messages(
         validate_identity!: true,
@@ -846,103 +874,45 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     it 'rejects a mismatched offering_id' do
       activate_offering
-
-      envelope = {
-        execution_contract: Legion::Extensions::Llm::Fleet::Protocol::EXACT_EXECUTION_CONTRACT,
-        offering_id: 'off:v1:0000000000000000000000000000000000000000000000000000000000000000',
-        provider: 'mlx',
-        provider_instance: instance_id,
-        model: 'mlx-community/Llama-3.2-3B-Instruct-4bit',
-        operation: 'chat',
-        params: { messages: [] }
-      }
-
-      expect do
-        Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry)
-      end.to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
+      bogus_id = 'off:v1:0000000000000000000000000000000000000000000000000000000000000000'
+      envelope = build_envelope(offering_id: bogus_id, model: 'mlx-community/Llama-3.2-3B-Instruct-4bit')
+      expect { Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry) }
+        .to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
     end
 
     it 'rejects an unsupported operation' do
       ctx = activate_offering
-
-      envelope = {
-        execution_contract: Legion::Extensions::Llm::Fleet::Protocol::EXACT_EXECUTION_CONTRACT,
-        offering_id: ctx[:offering].offering_id,
-        provider: 'mlx',
-        provider_instance: instance_id,
-        model: ctx[:offering].model,
-        operation: 'embed', # embed is unsupported for this chat model
-        params: { text: 'hello' }
-      }
-
-      expect do
-        Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry)
-      end.to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
+      envelope = build_envelope(offering_id: ctx[:offering].offering_id, model: ctx[:offering].model,
+                                operation: 'embed', params: { text: 'hello' })
+      expect { Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry) }
+        .to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
     end
 
     it 'rejects a mismatched model' do
       ctx = activate_offering
-
-      envelope = {
-        execution_contract: Legion::Extensions::Llm::Fleet::Protocol::EXACT_EXECUTION_CONTRACT,
-        offering_id: ctx[:offering].offering_id,
-        provider: 'mlx',
-        provider_instance: instance_id,
-        model: 'some-other-model/v1',
-        operation: 'chat',
-        params: { messages: [] }
-      }
-
-      expect do
-        Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry)
-      end.to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
+      envelope = build_envelope(offering_id: ctx[:offering].offering_id, model: 'some-other-model/v1')
+      expect { Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry) }
+        .to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
     end
 
     it 'rejects a stale publisher token (instance re-claimed)' do
       ctx = activate_offering
-
-      # Re-claim the instance (simulates restart)
-      new_callable = ssot_harness.build_callable(instance_config: config)
-      new_coordinator = Legion::Extensions::Llm::Inventory::ProbeCoordinator.new(
-        instance_key: key, enqueue: ->(**) { true }
-      )
       new_publisher = Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
-      new_token = new_publisher.claim_instance(instance_id: instance_id, callable: new_callable,
-                                               probe_request_handle: new_coordinator)
-      new_probe = new_publisher.readiness_probe_started(instance_id: instance_id, publisher_token: new_token)
-      new_drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: new_callable, tier: :local)
-      new_publisher.activate_instance_snapshot(
-        instance_id: instance_id, publisher_token: new_token, offerings: new_drafts, sequence: 0, probe_token: new_probe
-      )
-
-      # Old offering_id is now on a new callable - identity is deterministic
-      new_offering = registry.snapshot.offerings_for(instance_key: key).first
-      expect(new_offering.offering_id).to eq(ctx[:offering].offering_id)
+      claim_and_activate(publisher: new_publisher, callable: ssot_harness.build_callable(instance_config: config))
+      expect(registry.snapshot.offerings_for(instance_key: key).first.offering_id).to eq(ctx[:offering].offering_id)
     end
 
     it 'rejects an unavailable instance' do
       ctx = activate_offering
-
-      # Mark instance unavailable
       registry.dispatch_instance_unavailable(
-        instance_key: key,
-        publisher_token_id: ctx[:token].publisher_token_id,
-        reason: 'server down'
+        instance_key: key, publisher_token_id: ctx[:token].publisher_token_id, reason: 'server down'
       )
+      expect { execute_envelope(ctx) }.to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
+    end
 
-      envelope = {
-        execution_contract: Legion::Extensions::Llm::Fleet::Protocol::EXACT_EXECUTION_CONTRACT,
-        offering_id: ctx[:offering].offering_id,
-        provider: 'mlx',
-        provider_instance: instance_id,
-        model: ctx[:offering].model,
-        operation: 'chat',
-        params: { messages: [] }
-      }
-
-      expect do
-        Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry)
-      end.to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
+    def execute_envelope(ctx)
+      envelope = build_envelope(offering_id: ctx[:offering].offering_id, model: ctx[:offering].model)
+      Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry)
     end
   end
 
@@ -951,15 +921,12 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   describe 'dependency isolation' do
     it 'does not require Legion::LLM (no reverse dependency on top-level llm module)' do
       project_root = File.expand_path('../../../..', __dir__)
-      actor_file = File.read(
-        File.join(project_root, 'lib/legion/extensions/llm/mlx/actors/discovery_refresh.rb')
-      )
+      actor_file = File.read(File.join(project_root, 'lib/legion/extensions/llm/mlx/actors/discovery_refresh.rb'))
       expect(actor_file).not_to match(/\bLegion::LLM\b/)
     end
 
     it 'MlxCallable does not reference Legion::LLM' do
       callable = ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0])
-      # The callable uses Legion::Extensions::Llm::Routing::ProviderOutcome, not Legion::LLM
       outcome = callable.normalize_dispatch_error(error: RuntimeError.new('test'))
       expect(outcome).to be_a(Legion::Extensions::Llm::Routing::ProviderOutcome)
     end
@@ -993,25 +960,29 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     end
 
     it 'offering drafts require an explicit model string' do
+      expect { build_empty_model_offering }.to raise_error(
+        Legion::Extensions::Llm::Inventory::Errors::ValidationError
+      )
+    end
+
+    private
+
+    def build_empty_model_offering
       now = Time.now.freeze
-      expect do
-        Legion::Extensions::Llm::Inventory::OfferingDraft.new(
-          provider_native_key: 'test',
-          model: '',
-          tier: :local,
-          operation_evidence: ssot_harness.send(:build_operation_evidence, now: now, model_id: 'test'),
-          context_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
-          max_output_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
-          embedding_dimensions_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown,
-                                                                                               source: :absent),
-          model_revision_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown,
-                                                                                         source: :absent),
-          tokenizer_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
-          quota_domains: {},
-          metadata: {},
-          publication_source: :provider_catalog
-        )
-      end.to raise_error(Legion::Extensions::Llm::Inventory::Errors::ValidationError)
+      Legion::Extensions::Llm::Inventory::OfferingDraft.new(
+        provider_native_key: 'test', model: '', tier: :local,
+        operation_evidence: ssot_harness.send(:build_operation_evidence, now: now, model_id: 'test'),
+        context_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
+        max_output_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
+        embedding_dimensions_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(
+          status: :unknown, source: :absent
+        ),
+        model_revision_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(
+          status: :unknown, source: :absent
+        ),
+        tokenizer_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
+        quota_domains: {}, metadata: {}, publication_source: :provider_catalog
+      )
     end
   end
 
@@ -1052,8 +1023,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     it 'truncates reason to 512 bytes' do
       long_message = 'x' * 1000
-      error = RuntimeError.new(long_message)
-      outcome = callable.normalize_dispatch_error(error: error)
+      outcome = callable.normalize_dispatch_error(error: RuntimeError.new(long_message))
       expect(outcome.reason.length).to be <= 1024
     end
   end
@@ -1071,27 +1041,26 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     it 'includes all required operation evidence keys' do
       expected_ops = Legion::Extensions::Llm::Taxonomies::OPERATIONS.sort
-      drafts.each do |draft|
-        actual_ops = draft.operation_evidence.keys.sort
-        expect(actual_ops).to eq(expected_ops)
-      end
+      drafts.each { |d| expect(d.operation_evidence.keys.sort).to eq(expected_ops) }
     end
 
     it 'sets publication_source to :provider_catalog' do
-      drafts.each do |draft|
-        expect(draft.publication_source).to eq(:provider_catalog)
-      end
+      drafts.each { |draft| expect(draft.publication_source).to eq(:provider_catalog) }
     end
 
     it 'uses frozen metadata without secret keys' do
       drafts.each do |draft|
         expect(draft.metadata).to be_frozen
-        draft.metadata.each_key do |key|
-          normalized = key.to_s.downcase.gsub(/[^a-z0-9]/, '')
-          expect(normalized).not_to include('credential')
-          expect(normalized).not_to include('secret')
-          expect(normalized).not_to include('apikey')
-        end
+        draft.metadata.each_key { |k| expect_no_secrets(k) }
+      end
+    end
+
+    private
+
+    def expect_no_secrets(key)
+      normalized = key.to_s.downcase.gsub(/[^a-z0-9]/, '')
+      %w[credential secret apikey].each do |forbidden|
+        expect(normalized).not_to include(forbidden)
       end
     end
   end
@@ -1099,20 +1068,24 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   # --- ReadinessResult contract ------------------------------------------------
 
   describe 'ReadinessResult contract' do
-    it 'safe_readiness returns a ready ReadinessResult' do
-      config = ssot_harness.instance_configs[0]
-      callable = ssot_harness.build_callable(instance_config: config)
-      result = ssot_harness.safe_readiness(instance_config: config, callable: callable)
+    let(:config) { ssot_harness.instance_configs[0] }
+    let(:callable) { ssot_harness.build_callable(instance_config: config) }
+    let(:result) { ssot_harness.safe_readiness(instance_config: config, callable: callable) }
 
+    it 'returns a ReadinessResult' do
       expect(result).to be_a(Legion::Extensions::Llm::Inventory::ReadinessResult)
+    end
+
+    it 'reports ready status' do
       expect(result.ready?).to be(true)
+    end
+
+    it 'includes a non-empty reason string' do
       expect(result.reason).to be_a(String)
       expect(result.reason).not_to be_empty
     end
 
     it 'readiness does not invoke inference on the callable' do
-      config = ssot_harness.instance_configs[0]
-      callable = ssot_harness.build_callable(instance_config: config)
       ssot_harness.safe_readiness(instance_config: config, callable: callable)
       expect(ssot_harness.inference_call_count(callable: callable)).to eq(0)
     end

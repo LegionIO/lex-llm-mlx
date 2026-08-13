@@ -14,11 +14,5 @@ Metrics/BlockLength:
     - spec/**/*
 Metrics/MethodLength:
   Enabled: false
-RSpec/ExampleLength:
-  Exclude:
-    - spec/**/*_conformance_spec.rb
 RSpec/MultipleExpectations:
   Enabled: false
-RSpec/ExpectActual:
-  Exclude:
-    - spec/**/*_conformance_spec.rb
