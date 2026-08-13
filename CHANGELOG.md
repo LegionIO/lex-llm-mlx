@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.0] - 2026-08-13
+
+### Changed
+- **SSOT v3 provider migration** — Complete rewrite of `DiscoveryRefresh` actor to use `Inventory::Publisher`,
+  `OfferingDraft`, `ProbeCoordinator`, and `ReadinessResult` from lex-llm 0.7.0.
+- Add `MlxCallable` with `disconnect` / `normalize_dispatch_error(error:)` contracts for
+  `Inventory::CallableHandle` and `Routing::ProviderOutcome`.
+- Instance identity derived from normalized endpoint `host:port` plus optional API key SHA256 fingerprint.
+- Readiness probed via `/health` (non-inference, non-billable).
+- Embedding detection via model name pattern (`/embed|bge|e5|nomic/i`).
+- Operations: chat/stream_chat supported for non-embedding models; embed supported only for embedding models;
+  image/transcribe/translate/speak/moderate unsupported; count_tokens unknown.
+- Fleet worker passes `registry:` kwarg to `ProviderResponder.call` for exact-offering execution.
+- Remove all references to `Legion::LLM::Call::Registry` and `ScopedRefresher`.
+- Bump floor to `lex-llm >= 0.7.0`.
+
+### Added
+- Full SSOT v3 conformance spec (`mlx_ssot_v3_conformance_spec.rb`) exercising the shared
+  `'an SSOT v3 provider adapter'` examples plus MLX-specific identity, embedding, isolation,
+  and fleet execution contract tests.
+
 ## [0.3.14] - 2026-08-04
 
 ### Changed
