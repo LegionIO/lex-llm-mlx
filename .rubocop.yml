@@ -19,5 +19,3 @@ RSpec/MultipleExpectations:
 RSpec/SpecFilePathFormat:
   CustomTransform:
     Actor: actors
-  Exclude:
-    - spec/legion/extensions/llm/mlx/capability_policy_spec.rb

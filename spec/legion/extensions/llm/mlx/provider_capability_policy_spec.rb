@@ -52,10 +52,9 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Provider do
       expect(offering.capability_sources[:thinking]).to eq({ value: false, source: :default_false })
     end
 
-    it 'includes streaming from provider_catalog for a chat model' do
+    it 'does not include streaming for an unknown model without endpoint evidence' do
       offering = provider.send(:offering_from_model, bare_model)
-      expect(offering.capabilities).to include(:streaming)
-      expect(offering.capability_sources[:streaming][:source]).to eq(:provider_catalog)
+      expect(offering.capabilities).not_to include(:streaming)
     end
   end
 

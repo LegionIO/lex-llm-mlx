@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.5.0] - 2026-08-13
+
+### Changed
+- **SSOT v3 remediation pass 2** — Resolve all residual compliance violations from the first pass.
+- Remove source obfuscation: `UNKNOWN_EVIDENCE_SRC` constant restored to plain `:default_false` literal.
+- Remove second publication engine: `registry_publisher` class method and `attr_writer` removed from
+  `Provider`; `readiness` and `list_models` no longer call `publish_readiness_async` /
+  `publish_models_async` on the old `RegistryPublisher`. Single SSOT v3 `Inventory::Publisher` path only.
+- Remove regex-based authoritative capability claims: `extract_catalog_capabilities` and
+  `provider_envelope_capabilities` no longer promote model-name regex matches or hardcode streaming;
+  unverified capability support is unknown, not promoted to supported.
+- Fix `.rubocop.yml`: remove `RSpec/SpecFilePathFormat` `Exclude` entry for capability spec; rename
+  spec to `provider_capability_policy_spec.rb` to satisfy the path format cop cleanly.
+- Fix `settings.dig(:credentials, :api_key)` → `settings[:credentials][:api_key]` per §1.
+- Fix `settings[:endpoint] || 'http://localhost:8000'` → `settings[:endpoint]` (registered default).
+- Fix `api_base` to read the registered default from `settings[:instances][:default][:endpoint]`.
+- Fix swallowed `URI::InvalidURIError` rescue in `extract_host_port`: call `handle_exception` + re-raise.
+- Add `handle_exception` to `check_health` `Faraday::ConnectionFailed` and `StandardError` rescues.
+
 ## [0.4.0] - 2026-08-13
 
 ### Changed

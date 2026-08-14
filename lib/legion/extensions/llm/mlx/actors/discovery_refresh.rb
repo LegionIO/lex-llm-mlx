@@ -29,8 +29,7 @@ module Legion
           module EvidenceBuilding
             EMBEDDING_PATTERN = /embed|bge|e5|nomic/i
             # Protocol-required evidence source: the default_false taxonomy member.
-            # Uses %i[] form so the bare symbol literal does not appear in lib/.
-            UNKNOWN_EVIDENCE_SRC = %i[default_false].first
+            UNKNOWN_EVIDENCE_SRC = :default_false
 
             private
 
@@ -208,8 +207,10 @@ module Legion
               response = conn.get('/health')
               build_readiness_from_response(response: response, base_url: base_url)
             rescue Faraday::ConnectionFailed => e
+              handle_exception(e, level: :warn, handled: true, operation: 'mlx.actor.check_health')
               readiness_failure(reason: "MLX /health connection failed: #{e.message}", error: e)
             rescue StandardError => e
+              handle_exception(e, level: :warn, handled: true, operation: 'mlx.actor.check_health')
               readiness_failure(reason: "MLX /health error: #{e.message}", error: e)
             end
 
@@ -339,11 +340,10 @@ module Legion
               end
 
               if instances.empty?
-                endpoint = settings[:endpoint] || 'http://localhost:8000'
                 instances[:local] = {
-                  mlx_api_base: endpoint,
+                  mlx_api_base: settings[:endpoint],
                   tier: :local,
-                  mlx_api_key: settings.dig(:credentials, :api_key)
+                  mlx_api_key: settings[:credentials][:api_key]
                 }
               end
 
@@ -393,8 +393,9 @@ module Legion
               host = uri.host || 'localhost'
               port = uri.port
               "#{host}:#{port}"
-            rescue URI::InvalidURIError
-              'unknown:0'
+            rescue URI::InvalidURIError => e
+              handle_exception(e, level: :warn, operation: 'mlx.actor.extract_host_port', url: url.to_s)
+              raise
             end
 
             def build_instance_key(instance_id:)

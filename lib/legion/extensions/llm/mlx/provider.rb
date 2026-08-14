@@ -136,13 +136,10 @@ module Legion
             caps.is_a?(Hash) ? caps : {}
           end
 
-          def extract_catalog_capabilities(model_info)
-            model_id = model_info.respond_to?(:id) ? model_info.id.to_s : model_info.to_s
-            caps = {}
-            caps[:embeddings] = true if model_id.match?(/embed|bge|e5|nomic/i)
-            caps[:vision] = true if model_id.match?(/vlm|vision|llava|pixtral|qwen.*vl/i)
-            caps[:streaming] = true unless caps[:embeddings]
-            caps
+          def extract_catalog_capabilities(_model_info)
+            # Regex-based name matching is not authoritative evidence.
+            # Unverified capability support is unknown, not promoted to supported.
+            {}
           end
 
           def embedding_model?(model_id)
@@ -150,7 +147,8 @@ module Legion
           end
 
           def provider_envelope_capabilities
-            { streaming: true }
+            # No capabilities are advertised at the envelope level without endpoint evidence.
+            {}
           end
 
           def offering_metadata_for(model_info)
@@ -170,8 +168,6 @@ module Legion
           include CapabilityResolution
 
           class << self
-            attr_writer :registry_publisher
-
             def slug = 'mlx'
             def local? = true
             def default_transport = :http
@@ -179,10 +175,6 @@ module Legion
             def configuration_options = %i[mlx_api_base mlx_api_key]
             def configuration_requirements = []
             def capabilities = Capabilities
-
-            def registry_publisher
-              @registry_publisher ||= Legion::Extensions::Llm::RegistryPublisher.new(provider_family: :mlx)
-            end
           end
 
           def settings
@@ -190,7 +182,7 @@ module Legion
           end
 
           def api_base
-            normalize_url(config.mlx_api_base || settings[:endpoint] || 'http://localhost:8000')
+            normalize_url(config.mlx_api_base || settings[:instances][:default][:endpoint])
           end
 
           def headers
@@ -221,17 +213,14 @@ module Legion
 
           def readiness(live: false)
             log.info("Checking MLX readiness (live=#{live})")
-            super.tap do |metadata|
-              self.class.registry_publisher.publish_readiness_async(metadata) if live
-            end
+            super
           end
 
           def list_models(**)
             log.info('Listing available MLX models')
-            super.tap do |models|
-              log.info("Discovered #{Array(models).size} MLX models")
-              self.class.registry_publisher.publish_models_async(models, readiness: readiness(live: false))
-            end
+            models = super
+            log.info("Discovered #{Array(models).size} MLX models")
+            models
           end
 
           def offering_from_model(model_info, health: {})
