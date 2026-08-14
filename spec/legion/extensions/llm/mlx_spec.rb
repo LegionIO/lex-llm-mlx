@@ -7,17 +7,21 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   let(:model) { Legion::Extensions::Llm::Model::Info.new(id: 'mlx-community/Qwen3-14B-4bit', provider: :mlx) }
   let(:registry_publisher) { instance_double(Legion::Extensions::Llm::RegistryPublisher) }
 
-  it 'exposes provider defaults through the shared provider settings shape' do # rubocop:disable RSpec/ExampleLength
+  it 'exposes provider defaults through the shared provider settings shape' do
     settings = described_class.default_settings
-    instance = settings.dig(:instances, :default)
-
     expect(settings[:enabled]).to be true
     expect(settings[:provider_family]).to eq(:mlx)
-    expect(instance).to include(
-      endpoint: 'http://localhost:8000',
-      credentials: hash_including(api_key: nil),
-      fleet: hash_including(respond_to_requests: false)
-    )
+  end
+
+  it 'includes endpoint default in provider settings' do
+    instance = described_class.default_settings.dig(:instances, :default)
+    expect(instance).to include(endpoint: 'http://localhost:8000')
+  end
+
+  it 'includes credentials and fleet defaults in provider settings' do
+    instance = described_class.default_settings.dig(:instances, :default)
+    expect(instance).to include(credentials: hash_including(api_key: nil),
+                                fleet: hash_including(respond_to_requests: false))
   end
 
   it 'does not register on the deprecated Provider.register registry' do
@@ -112,27 +116,28 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       expect(instances[:local]).to eq(base_url: 'http://localhost:8000', tier: :local, capabilities: [:completion])
     end
 
-    it 'discovers named instances from extension settings' do # rubocop:disable RSpec/ExampleLength
+    it 'discovers named instances from extension settings' do
       allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
         .with(:extensions, :llm, :mlx, :instances)
         .and_return({ gpu1: { base_url: 'http://gpu1:8080' } })
-
       instances = described_class.discover_instances
-
       expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080', tier: :direct)
+    end
+
+    it 'removes base_url key after normalization' do
+      allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
+        .with(:extensions, :llm, :mlx, :instances)
+        .and_return({ gpu1: { base_url: 'http://gpu1:8080' } })
+      instances = described_class.discover_instances
       expect(instances[:gpu1]).not_to have_key(:base_url)
     end
 
-    it 'normalizes OpenAI-compatible /v1 settings roots' do # rubocop:disable RSpec/ExampleLength
+    it 'normalizes OpenAI-compatible /v1 settings roots' do
       allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
         .with(:extensions, :llm, :mlx, :instances)
         .and_return({ gpu1: { base_url: 'http://gpu1:8080/v1', api_key: 'mlx-key' } })
-
       instances = described_class.discover_instances
-
-      expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080',
-                                          mlx_api_key: 'mlx-key',
-                                          tier: :direct)
+      expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080', mlx_api_key: 'mlx-key', tier: :direct)
     end
 
     it 'combines local and settings instances' do

@@ -16,3 +16,8 @@ Metrics/MethodLength:
   Enabled: false
 RSpec/MultipleExpectations:
   Enabled: false
+RSpec/SpecFilePathFormat:
+  CustomTransform:
+    Actor: actors
+  Exclude:
+    - spec/legion/extensions/llm/mlx/capability_policy_spec.rb

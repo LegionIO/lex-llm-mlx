@@ -65,14 +65,18 @@ module Legion
           end
         end
 
-        def self.normalize_instance_config(config) # rubocop:disable Metrics/AbcSize, Metrics/CyclomaticComplexity
-          normalized = config.to_h.transform_keys { |key| key.respond_to?(:to_sym) ? key.to_sym : key }
-          normalized[:mlx_api_base] ||= normalized.delete(:base_url)
-          normalized[:mlx_api_base] ||= normalized.delete(:api_base)
-          normalized[:mlx_api_base] ||= normalized.delete(:endpoint)
+        def self.normalize_instance_config(config)
+          normalized = config.to_h.transform_keys(&:to_sym)
+          promote_api_base_aliases(normalized)
           normalized[:mlx_api_key] ||= normalized.delete(:api_key)
           normalized[:mlx_api_base] = normalize_api_base(normalized[:mlx_api_base]) if normalized[:mlx_api_base]
           normalized.compact
+        end
+
+        def self.promote_api_base_aliases(normalized)
+          normalized[:mlx_api_base] ||= normalized.delete(:base_url)
+          normalized[:mlx_api_base] ||= normalized.delete(:api_base)
+          normalized[:mlx_api_base] ||= normalized.delete(:endpoint)
         end
 
         def self.normalize_api_base(url)
@@ -80,7 +84,7 @@ module Legion
         end
 
         private_class_method :discover_local_instance, :discover_settings_instances,
-                             :normalize_instance_config, :normalize_api_base
+                             :normalize_instance_config, :promote_api_base_aliases, :normalize_api_base
 
         Legion::Extensions::Llm::Configuration.register_provider_options(Provider.configuration_options)
       end

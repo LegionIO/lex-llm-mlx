@@ -29,6 +29,12 @@ if Gem.loaded_specs['lex-llm']
   Dir[File.join(kit_path, '**', '*.rb')].each { |f| require f }
 end
 
+if defined?(Legion::Settings)
+  s = Legion::Settings.loader.settings
+  s[:extensions][:llm] ||= {}
+  s[:extensions][:llm][:mlx] ||= {}
+end
+
 if defined?(Legion::Logging)
   null_logger = Logger.new(File::NULL)
   null_logger.level = Logger::DEBUG

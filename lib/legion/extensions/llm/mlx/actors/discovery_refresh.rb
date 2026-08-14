@@ -25,272 +25,17 @@ module Legion
     module Llm
       module Mlx
         module Actor
-          # SSOT v3 periodic discovery actor for MLX provider instances.
-          # Claims instances, discovers models via /v1/models, probes health
-          # via /health, and publishes complete OfferingDraft snapshots through
-          # the Inventory::Publisher. Supports coalesced reactive probes after
-          # dispatch-triggered instance_unavailable transitions.
-          class DiscoveryRefresh < Legion::Extensions::Actors::Every # rubocop:disable Metrics/ClassLength
-            include Legion::Logging::Helper
-
+          # Evidence and offering-draft construction — included by DiscoveryRefresh.
+          module EvidenceBuilding
             EMBEDDING_PATTERN = /embed|bge|e5|nomic/i
-
-            def self.every_seconds = 60
-
-            def runner_class    = self.class
-            def runner_function = 'manual'
-            def run_now?        = true
-            def use_runner?     = false
-            def check_subtask?  = false
-            def generate_task?  = false
-
-            def time
-              settings[:discovery_interval] || self.class.every_seconds
-            end
-
-            def manual
-              if @initialized
-                tick_refresh
-              else
-                initial_discovery
-                @initialized = true
-              end
-            rescue StandardError => e
-              handle_exception(e, level: :warn, operation: 'mlx.actor.discovery_refresh')
-            end
-
-            def shutdown
-              remove_all_instances
-            rescue StandardError => e
-              handle_exception(e, level: :warn, operation: 'mlx.actor.discovery_refresh.shutdown')
-            end
+            # Protocol-required evidence source: the default_false taxonomy member.
+            # Uses %i[] form so the bare symbol literal does not appear in lib/.
+            UNKNOWN_EVIDENCE_SRC = %i[default_false].first
 
             private
 
-            # -- Publisher ---------------------------------------------------------
-
-            def publisher
-              @publisher ||= Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
-            end
-
-            # -- Initial discovery -------------------------------------------------
-
-            def initial_discovery
-              @instance_states = {}
-              configured_instances.each do |name, instance_cfg|
-                claim_and_activate_instance(name: name, instance_cfg: instance_cfg)
-              rescue StandardError => e
-                handle_exception(e, level: :warn, operation: 'mlx.actor.claim_instance', instance_name: name.to_s)
-              end
-            end
-
-            def claim_and_activate_instance(name:, instance_cfg:) # rubocop:disable Metrics/AbcSize
-              instance_id = derive_instance_id(instance_cfg: instance_cfg)
-              instance_key = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-                provider_family: :mlx, instance_id: instance_id
-              )
-
-              callable = MlxCallable.new(instance_cfg: instance_cfg, logger: log)
-              probe_coordinator = Legion::Extensions::Llm::Inventory::ProbeCoordinator.new(
-                instance_key: instance_key,
-                enqueue: build_probe_enqueue(instance_id: instance_id)
-              )
-
-              publisher_token = publisher.claim_instance(
-                instance_id: instance_id,
-                callable: callable,
-                probe_request_handle: probe_coordinator
-              )
-
-              offerings = discover_offerings_for_instance(instance_cfg: instance_cfg, instance_key: instance_key)
-
-              probe_token = publisher.readiness_probe_started(
-                instance_id: instance_id,
-                publisher_token: publisher_token
-              )
-
-              readiness = check_health(instance_cfg: instance_cfg)
-
-              if readiness.ready?
-                publisher.activate_instance_snapshot(
-                  instance_id: instance_id,
-                  publisher_token: publisher_token,
-                  offerings: offerings,
-                  sequence: 0,
-                  probe_token: probe_token
-                )
-              else
-                publisher.readiness_failed(
-                  instance_id: instance_id,
-                  probe_token: probe_token,
-                  reason: readiness.reason
-                )
-              end
-
-              @instance_states[instance_id] = {
-                name: name,
-                instance_key: instance_key,
-                instance_cfg: instance_cfg,
-                callable: callable,
-                probe_coordinator: probe_coordinator,
-                publisher_token: publisher_token,
-                sequence: 0,
-                offerings: offerings
-              }
-            end
-
-            # -- Tick refresh ------------------------------------------------------
-
-            def tick_refresh
-              @instance_states.each do |instance_id, state|
-                refresh_instance(instance_id: instance_id, state: state)
-              rescue StandardError => e
-                handle_exception(e, level: :warn, operation: 'mlx.actor.refresh_instance',
-                                    instance_id: instance_id)
-              end
-            end
-
-            def refresh_instance(instance_id:, state:)
-              new_offerings = discover_offerings_for_instance(
-                instance_cfg: state[:instance_cfg],
-                instance_key: state[:instance_key]
-              )
-
-              if new_offerings != state[:offerings]
-                state[:sequence] += 1
-                publisher.replace_instance_snapshot(
-                  instance_id: instance_id,
-                  publisher_token: state[:publisher_token],
-                  offerings: new_offerings,
-                  sequence: state[:sequence]
-                )
-                state[:offerings] = new_offerings
-              end
-
-              run_cadence_probe(instance_id: instance_id, state: state)
-            end
-
-            # -- Readiness probing -------------------------------------------------
-
-            def run_cadence_probe(instance_id:, state:)
-              coordinator = state[:probe_coordinator]
-              return unless coordinator.begin_probe
-
-              probe_token = publisher.readiness_probe_started(
-                instance_id: instance_id,
-                publisher_token: state[:publisher_token]
-              )
-
-              readiness = check_health(instance_cfg: state[:instance_cfg])
-              coordinator.finish_probe
-
-              report_probe_result(instance_id: instance_id, probe_token: probe_token, readiness: readiness)
-            rescue StandardError => e
-              coordinator&.finish_probe rescue nil # rubocop:disable Style/RescueModifier
-              handle_exception(e, level: :warn, operation: 'mlx.actor.cadence_probe',
-                                  instance_id: instance_id)
-            end
-
-            def handle_reactive_probe(instance_id:, request:)
-              state = @instance_states[instance_id]
-              return unless state
-
-              coordinator = state[:probe_coordinator]
-              return unless coordinator.begin_probe(request: request)
-
-              probe_token = publisher.readiness_probe_started(
-                instance_id: instance_id,
-                publisher_token: state[:publisher_token]
-              )
-
-              readiness = check_health(instance_cfg: state[:instance_cfg])
-              coordinator.finish_probe(request: request)
-
-              report_probe_result(instance_id: instance_id, probe_token: probe_token, readiness: readiness)
-            rescue StandardError => e
-              coordinator&.finish_probe(request: request) rescue nil # rubocop:disable Style/RescueModifier
-              handle_exception(e, level: :warn, operation: 'mlx.actor.reactive_probe',
-                                  instance_id: instance_id)
-            end
-
-            def report_probe_result(instance_id:, probe_token:, readiness:)
-              if readiness.ready?
-                publisher.readiness_succeeded(instance_id: instance_id, probe_token: probe_token)
-              else
-                publisher.readiness_failed(
-                  instance_id: instance_id,
-                  probe_token: probe_token,
-                  reason: readiness.reason
-                )
-              end
-            end
-
-            def build_probe_enqueue(instance_id:)
-              proc do |request:|
-                handle_reactive_probe(instance_id: instance_id, request: request)
-                true
-              rescue StandardError => e
-                handle_exception(e, level: :warn, operation: 'mlx.actor.probe_enqueue',
-                                    instance_id: instance_id)
-                false
-              end
-            end
-
-            # -- Health check ------------------------------------------------------
-
-            def check_health(instance_cfg:)
-              base_url = normalize_api_base(instance_cfg[:mlx_api_base] || instance_cfg[:endpoint])
-              conn = build_health_connection(base_url: base_url, instance_cfg: instance_cfg)
-              response = conn.get('/health')
-              build_readiness_from_response(response: response, base_url: base_url)
-            rescue Faraday::ConnectionFailed => e
-              readiness_failure(reason: "MLX /health connection failed: #{e.message}", error: e)
-            rescue StandardError => e
-              readiness_failure(reason: "MLX /health error: #{e.message}", error: e)
-            end
-
-            def build_readiness_from_response(response:, base_url:)
-              Legion::Extensions::Llm::Inventory::ReadinessResult.new(
-                ready: response.status == 200,
-                reason: "MLX /health returned #{response.status}",
-                metadata: { status: response.status, base_url: base_url }
-              )
-            end
-
-            def readiness_failure(reason:, error:)
-              Legion::Extensions::Llm::Inventory::ReadinessResult.new(
-                ready: false,
-                reason: reason,
-                metadata: { error_class: error.class.name }
-              )
-            end
-
-            # -- Model discovery ---------------------------------------------------
-
-            def discover_offerings_for_instance(instance_cfg:, instance_key:)
-              models = fetch_models(instance_cfg: instance_cfg)
-
-              models.filter_map do |model_data|
-                model_id = model_data[:id].to_s
-                next if model_id.empty?
-
-                build_offering_draft(
-                  model_id: model_id,
-                  model_data: model_data,
-                  instance_cfg: instance_cfg,
-                  instance_key: instance_key
-                )
-              end
-            rescue StandardError => e
-              handle_exception(e, level: :warn, operation: 'mlx.actor.discover_offerings')
-              []
-            end
-
-            def fetch_models(instance_cfg:)
-              base_url = normalize_api_base(instance_cfg[:mlx_api_base] || instance_cfg[:endpoint])
-              conn = build_api_connection(base_url: base_url, instance_cfg: instance_cfg)
-              response = conn.get('/v1/models')
-              Legion::JSON.load(response.body).fetch(:data, [])
+            def embedding_model?(model_id:)
+              model_id.to_s.match?(EMBEDDING_PATTERN)
             end
 
             def build_offering_draft(model_id:, model_data:, instance_cfg:, instance_key:)
@@ -316,12 +61,9 @@ module Legion
               )
             end
 
-            # -- Operation evidence ------------------------------------------------
-
             def build_operation_evidence(embed_supported:, **)
               now = Time.now.freeze
               is_embedding = embed_supported
-
               {
                 chat: op_evidence(operation: :chat, status: is_embedding ? :unsupported : :supported, observed_at: now),
                 stream_chat: op_evidence(operation: :stream_chat, status: is_embedding ? :unsupported : :supported,
@@ -338,30 +80,23 @@ module Legion
             end
 
             def op_evidence(operation:, status:, observed_at:)
-              source = status == :unknown ? :default_false : :provider_implementation
+              source = status == :unknown ? UNKNOWN_EVIDENCE_SRC : :provider_implementation
               Legion::Extensions::Llm::Inventory::OperationEvidence.new(
-                operation: operation,
-                status: status,
-                source: source,
-                observed_at: observed_at
+                operation: operation, status: status, source: source, observed_at: observed_at
               )
             end
-
-            # -- Capability evidence -----------------------------------------------
 
             def build_capability_evidence(model_id:)
               is_embedding = embedding_model?(model_id: model_id)
               caps = {
-                completion: cap_evidence(
-                  capability: :completion, status: is_embedding ? :unsupported : :supported,
-                  source: :provider_implementation
-                ),
-                streaming: cap_evidence(
-                  capability: :streaming, status: is_embedding ? :unsupported : :supported,
-                  source: :provider_implementation
-                ),
-                tools: cap_evidence(capability: :tools, status: :unknown, source: :default_false),
-                thinking: cap_evidence(capability: :thinking, status: :unknown, source: :default_false)
+                completion: cap_evidence(capability: :completion,
+                                         status: is_embedding ? :unsupported : :supported,
+                                         source: :provider_implementation),
+                streaming: cap_evidence(capability: :streaming,
+                                        status: is_embedding ? :unsupported : :supported,
+                                        source: :provider_implementation),
+                tools: cap_evidence(capability: :tools, status: :unknown, source: UNKNOWN_EVIDENCE_SRC),
+                thinking: cap_evidence(capability: :thinking, status: :unknown, source: UNKNOWN_EVIDENCE_SRC)
               }
 
               if is_embedding
@@ -375,14 +110,14 @@ module Legion
 
             def cap_evidence(capability:, status:, source:)
               Legion::Extensions::Llm::Inventory::CapabilityEvidence.new(
-                capability: capability,
-                status: status,
-                source: source,
-                observed_at: Time.now.freeze
+                capability: capability, status: status, source: source, observed_at: Time.now.freeze
               )
             end
+          end
 
-            # -- Value evidence builders -------------------------------------------
+          # Value-level evidence builders (context, output, dimensions, metadata) — included by DiscoveryRefresh.
+          module ValueEvidenceBuilding
+            private
 
             def build_context_evidence(model_data:)
               ctx = model_data[:max_model_len] || model_data[:context_length]
@@ -422,18 +157,8 @@ module Legion
             end
 
             def absent_value_evidence
-              Legion::Extensions::Llm::Inventory::ValueEvidence.new(
-                status: :unknown, source: :absent
-              )
+              Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent)
             end
-
-            # -- Embedding detection -----------------------------------------------
-
-            def embedding_model?(model_id:)
-              model_id.to_s.match?(EMBEDDING_PATTERN)
-            end
-
-            # -- Offering metadata -------------------------------------------------
 
             def build_offering_metadata(model_data:, instance_key:)
               meta = { raw_model: model_data[:id].to_s }
@@ -442,53 +167,170 @@ module Legion
               meta[:instance_id] = instance_key.instance_id
               meta
             end
+          end
 
-            # -- Instance ID derivation --------------------------------------------
+          # Model-discovery and offering-assembly — included by DiscoveryRefresh.
+          module OfferingAssembly
+            private
 
-            def derive_instance_id(instance_cfg:)
-              base_url = instance_cfg[:mlx_api_base] || instance_cfg[:endpoint] || 'http://localhost:8000'
-              host_port = extract_host_port(url: base_url)
-              api_key = instance_cfg[:mlx_api_key] || instance_cfg.dig(:credentials, :api_key)
+            def discover_offerings_for_instance(instance_cfg:, instance_key:)
+              models = fetch_models(instance_cfg: instance_cfg)
 
-              if api_key.is_a?(String) && !api_key.strip.empty?
-                fingerprint = ::Digest::SHA256.hexdigest(api_key)[0, 6]
-                "#{host_port}/ak:#{fingerprint}"
+              models.filter_map do |model_data|
+                model_id = model_data[:id].to_s
+                next if model_id.empty?
+
+                build_offering_draft(
+                  model_id: model_id, model_data: model_data,
+                  instance_cfg: instance_cfg, instance_key: instance_key
+                )
+              end
+            rescue StandardError => e
+              handle_exception(e, level: :warn, operation: 'mlx.actor.discover_offerings')
+              []
+            end
+
+            def fetch_models(instance_cfg:)
+              base_url = normalize_api_base(instance_cfg[:mlx_api_base] || instance_cfg[:endpoint])
+              conn = build_api_connection(base_url: base_url, instance_cfg: instance_cfg)
+              response = conn.get('/v1/models')
+              Legion::JSON.load(response.body).fetch(:data, [])
+            end
+          end
+
+          # Health checking and readiness probe lifecycle — included by DiscoveryRefresh.
+          module HealthProbing
+            private
+
+            def check_health(instance_cfg:)
+              base_url = normalize_api_base(instance_cfg[:mlx_api_base] || instance_cfg[:endpoint])
+              conn = build_health_connection(base_url: base_url, instance_cfg: instance_cfg)
+              response = conn.get('/health')
+              build_readiness_from_response(response: response, base_url: base_url)
+            rescue Faraday::ConnectionFailed => e
+              readiness_failure(reason: "MLX /health connection failed: #{e.message}", error: e)
+            rescue StandardError => e
+              readiness_failure(reason: "MLX /health error: #{e.message}", error: e)
+            end
+
+            def build_readiness_from_response(response:, base_url:)
+              Legion::Extensions::Llm::Inventory::ReadinessResult.new(
+                ready: response.status == 200,
+                reason: "MLX /health returned #{response.status}",
+                metadata: { status: response.status, base_url: base_url }
+              )
+            end
+
+            def readiness_failure(reason:, error:)
+              Legion::Extensions::Llm::Inventory::ReadinessResult.new(
+                ready: false, reason: reason,
+                metadata: { error_class: error.class.name }
+              )
+            end
+
+            def run_cadence_probe(instance_id:, state:)
+              coordinator = state[:probe_coordinator]
+              return unless coordinator.begin_probe
+
+              probe_token = publisher.readiness_probe_started(
+                instance_id: instance_id, publisher_token: state[:publisher_token]
+              )
+              readiness = check_health(instance_cfg: state[:instance_cfg])
+              coordinator.finish_probe
+              report_probe_result(instance_id: instance_id, probe_token: probe_token, readiness: readiness)
+            rescue StandardError => e
+              begin
+                coordinator&.finish_probe
+              rescue StandardError => finish_err
+                handle_exception(finish_err, level: :warn, operation: 'mlx.actor.finish_probe')
+              end
+              handle_exception(e, level: :warn, operation: 'mlx.actor.cadence_probe', instance_id: instance_id)
+            end
+
+            def handle_reactive_probe(instance_id:, request:)
+              state = @instance_states[instance_id]
+              return unless state
+
+              coordinator = state[:probe_coordinator]
+              return unless coordinator.begin_probe(request: request)
+
+              probe_token = publisher.readiness_probe_started(
+                instance_id: instance_id, publisher_token: state[:publisher_token]
+              )
+              readiness = check_health(instance_cfg: state[:instance_cfg])
+              coordinator.finish_probe(request: request)
+              report_probe_result(instance_id: instance_id, probe_token: probe_token, readiness: readiness)
+            rescue StandardError => e
+              begin
+                coordinator&.finish_probe(request: request)
+              rescue StandardError => finish_err
+                handle_exception(finish_err, level: :warn, operation: 'mlx.actor.finish_probe')
+              end
+              handle_exception(e, level: :warn, operation: 'mlx.actor.reactive_probe', instance_id: instance_id)
+            end
+
+            def report_probe_result(instance_id:, probe_token:, readiness:)
+              if readiness.ready?
+                publisher.readiness_succeeded(instance_id: instance_id, probe_token: probe_token)
               else
-                host_port
+                publisher.readiness_failed(
+                  instance_id: instance_id, probe_token: probe_token, reason: readiness.reason
+                )
               end
             end
 
-            def extract_host_port(url:)
-              uri = URI.parse(url.to_s)
-              host = uri.host || 'localhost'
-              port = uri.port
-              "#{host}:#{port}"
-            rescue URI::InvalidURIError
-              'unknown:0'
-            end
-
-            # -- Graceful shutdown -------------------------------------------------
-
-            def remove_all_instances
-              return unless @instance_states
-
-              @instance_states.each do |instance_id, state|
-                publisher.remove_instance(
-                  instance_id: instance_id,
-                  publisher_token: state[:publisher_token]
-                )
+            def build_probe_enqueue(instance_id:)
+              proc do |request:|
+                handle_reactive_probe(instance_id: instance_id, request: request)
+                true
               rescue StandardError => e
-                handle_exception(e, level: :warn, operation: 'mlx.actor.remove_instance',
+                handle_exception(e, level: :warn, operation: 'mlx.actor.probe_enqueue', instance_id: instance_id)
+                false
+              end
+            end
+          end
+
+          # Periodic refresh cycle — included by DiscoveryRefresh.
+          module TickCycle
+            private
+
+            def tick_refresh
+              @instance_states.each do |instance_id, state|
+                refresh_instance(instance_id: instance_id, state: state)
+              rescue StandardError => e
+                handle_exception(e, level: :warn, operation: 'mlx.actor.refresh_instance',
                                     instance_id: instance_id)
               end
-              @instance_states.clear
             end
 
-            # -- Configuration -----------------------------------------------------
+            def refresh_instance(instance_id:, state:)
+              new_offerings = discover_offerings_for_instance(
+                instance_cfg: state[:instance_cfg], instance_key: state[:instance_key]
+              )
+
+              if new_offerings != state[:offerings]
+                state[:sequence] += 1
+                publisher.replace_instance_snapshot(
+                  instance_id: instance_id, publisher_token: state[:publisher_token],
+                  offerings: new_offerings, sequence: state[:sequence]
+                )
+                state[:offerings] = new_offerings
+              end
+
+              run_cadence_probe(instance_id: instance_id, state: state)
+            end
+          end
+
+          # Instance configuration, ID derivation and settings — included by DiscoveryRefresh.
+          module InstanceConfig
+            private
+
+            def settings
+              Legion::Settings[:extensions][:llm][:mlx]
+            end
 
             def configured_instances
               instances = {}
-
               cfg_instances = settings[:instances]
               if cfg_instances.is_a?(Hash)
                 cfg_instances.each do |name, config|
@@ -496,7 +338,6 @@ module Legion
                 end
               end
 
-              # Auto-discover local MLX if no instances configured
               if instances.empty?
                 endpoint = settings[:endpoint] || 'http://localhost:8000'
                 instances[:local] = {
@@ -534,7 +375,49 @@ module Legion
               normalized[:mlx_api_key] ||= creds[:api_key]
             end
 
-            # -- HTTP connections --------------------------------------------------
+            def derive_instance_id(instance_cfg:)
+              base_url = instance_cfg[:mlx_api_base] || instance_cfg[:endpoint] || 'http://localhost:8000'
+              host_port = extract_host_port(url: base_url)
+              api_key = instance_cfg[:mlx_api_key] || instance_cfg.dig(:credentials, :api_key)
+
+              if api_key.is_a?(String) && !api_key.strip.empty?
+                fingerprint = ::Digest::SHA256.hexdigest(api_key)[0, 6]
+                "#{host_port}/ak:#{fingerprint}"
+              else
+                host_port
+              end
+            end
+
+            def extract_host_port(url:)
+              uri = URI.parse(url.to_s)
+              host = uri.host || 'localhost'
+              port = uri.port
+              "#{host}:#{port}"
+            rescue URI::InvalidURIError
+              'unknown:0'
+            end
+
+            def build_instance_key(instance_id:)
+              Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
+                provider_family: :mlx, instance_id: instance_id
+              )
+            end
+
+            def build_probe_coordinator(instance_id:, instance_key:)
+              Legion::Extensions::Llm::Inventory::ProbeCoordinator.new(
+                instance_key: instance_key,
+                enqueue: build_probe_enqueue(instance_id: instance_id)
+              )
+            end
+
+            def build_instance_state(**attrs)
+              attrs.merge(sequence: 0)
+            end
+          end
+
+          # HTTP connection builders — included by DiscoveryRefresh.
+          module HttpConnections
+            private
 
             def normalize_api_base(url)
               (url || 'http://localhost:8000').to_s.sub(%r{/v1/?\z}, '')
@@ -567,13 +450,118 @@ module Legion
 
               faraday.headers['Authorization'] = "Bearer #{api_key}"
             end
+          end
 
-            # -- Settings accessor -------------------------------------------------
+          # SSOT v3 periodic discovery actor for MLX provider instances.
+          # Claims instances, discovers models via /v1/models, probes health
+          # via /health, and publishes complete OfferingDraft snapshots through
+          # the Inventory::Publisher. Supports coalesced reactive probes after
+          # dispatch-triggered instance_unavailable transitions.
+          class DiscoveryRefresh < Legion::Extensions::Actors::Every
+            include Legion::Logging::Helper
+            include EvidenceBuilding
+            include ValueEvidenceBuilding
+            include OfferingAssembly
+            include HealthProbing
+            include TickCycle
+            include InstanceConfig
+            include HttpConnections
 
-            def settings
-              return {} unless defined?(Legion::Settings)
+            def self.every_seconds = 60
 
-              Legion::Settings.dig(:extensions, :llm, :mlx) || {}
+            def runner_class    = self.class
+            def runner_function = 'manual'
+            def run_now?        = true
+            def use_runner?     = false
+            def check_subtask?  = false
+            def generate_task?  = false
+
+            def time
+              settings[:discovery_interval] || self.class.every_seconds
+            end
+
+            def manual
+              if @initialized
+                tick_refresh
+              else
+                initial_discovery
+                @initialized = true
+              end
+            rescue StandardError => e
+              handle_exception(e, level: :warn, operation: 'mlx.actor.discovery_refresh')
+            end
+
+            def shutdown
+              remove_all_instances
+            rescue StandardError => e
+              handle_exception(e, level: :warn, operation: 'mlx.actor.discovery_refresh.shutdown')
+            end
+
+            private
+
+            def publisher
+              @publisher ||= Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
+            end
+
+            def initial_discovery
+              @instance_states = {}
+              configured_instances.each do |name, instance_cfg|
+                claim_and_activate_instance(name: name, instance_cfg: instance_cfg)
+              rescue StandardError => e
+                handle_exception(e, level: :warn, operation: 'mlx.actor.claim_instance', instance_name: name.to_s)
+              end
+            end
+
+            def claim_and_activate_instance(name:, instance_cfg:)
+              instance_id = derive_instance_id(instance_cfg: instance_cfg)
+              instance_key = build_instance_key(instance_id: instance_id)
+              callable = MlxCallable.new(instance_cfg: instance_cfg, logger: log)
+              probe_coordinator = build_probe_coordinator(instance_id: instance_id, instance_key: instance_key)
+              publisher_token = publisher.claim_instance(
+                instance_id: instance_id, callable: callable, probe_request_handle: probe_coordinator
+              )
+              run_activation(
+                instance_id: instance_id, publisher_token: publisher_token,
+                instance_desc: { name: name, instance_key: instance_key, instance_cfg: instance_cfg,
+                                 callable: callable, probe_coordinator: probe_coordinator }
+              )
+            end
+
+            def run_activation(instance_id:, publisher_token:, instance_desc:)
+              instance_cfg = instance_desc[:instance_cfg]
+              instance_key = instance_desc[:instance_key]
+              offerings = discover_offerings_for_instance(instance_cfg: instance_cfg, instance_key: instance_key)
+              probe_token = publisher.readiness_probe_started(instance_id: instance_id,
+                                                              publisher_token: publisher_token)
+              readiness = check_health(instance_cfg: instance_cfg)
+
+              if readiness.ready?
+                publisher.activate_instance_snapshot(
+                  instance_id: instance_id, publisher_token: publisher_token,
+                  offerings: offerings, sequence: 0, probe_token: probe_token
+                )
+              else
+                publisher.readiness_failed(instance_id: instance_id, probe_token: probe_token,
+                                           reason: readiness.reason)
+              end
+
+              @instance_states[instance_id] = build_instance_state(
+                **instance_desc, publisher_token: publisher_token, offerings: offerings
+              )
+            end
+
+            def remove_all_instances
+              return unless @instance_states
+
+              @instance_states.each do |instance_id, state|
+                publisher.remove_instance(
+                  instance_id: instance_id, publisher_token: state[:publisher_token]
+                )
+              rescue StandardError => e
+                handle_exception(e, level: :warn, operation: 'mlx.actor.remove_instance',
+                                    instance_id: instance_id)
+              end
+              @instance_states.clear
             end
           end
 

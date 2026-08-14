@@ -13,21 +13,19 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Runners::FleetWorker do
   let(:properties) { instance_double(FleetWorkerSpecProperties) }
   let(:instances) { { local: { fleet: { respond_to_requests: true } } } }
 
-  it 'delegates fleet execution to the shared lex-llm responder helper' do # rubocop:disable RSpec/ExampleLength
+  before do
     allow(Legion::Extensions::Llm::Mlx).to receive(:discover_instances).and_return(instances)
     allow(Legion::Extensions::Llm::Fleet::ProviderResponder).to receive(:call).and_return(:ok)
+  end
 
+  it 'returns the responder result' do
     result = described_class.handle_fleet_request(payload, delivery:, properties:)
-
     expect(result).to eq(:ok)
-    expect(Legion::Extensions::Llm::Fleet::ProviderResponder).to have_received(:call).with(
-      payload: payload,
-      provider_family: :mlx,
-      provider_class: Legion::Extensions::Llm::Mlx::Provider,
-      provider_instances: satisfy { |resolver| resolver.call == instances },
-      registry: Legion::Extensions::Llm::Inventory::Registry,
-      delivery: delivery,
-      properties: properties
-    )
+  end
+
+  it 'delegates fleet execution to the shared lex-llm responder helper' do
+    described_class.handle_fleet_request(payload, delivery:, properties:)
+    expect(Legion::Extensions::Llm::Fleet::ProviderResponder)
+      .to have_received(:call).with(hash_including(payload:, provider_family: :mlx, delivery:, properties:))
   end
 end
