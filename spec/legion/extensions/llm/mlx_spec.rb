@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'legion/extensions/llm/fleet/provider_responder'
 
 RSpec.describe Legion::Extensions::Llm::Mlx do
   let(:provider) { described_class::Provider.new(Legion::Extensions::Llm.config) }
@@ -61,53 +62,46 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   end
 
   describe '.discover_instances' do
-    before do
-      allow(Legion::Extensions::Llm::CredentialSources).to receive_messages(socket_open?: false, setting: nil)
-    end
+    let(:settings_tree) { Legion::Settings.loader.settings[:extensions][:llm][:mlx] }
 
-    it 'returns an empty hash when no local server or settings are available' do
-      expect(described_class.discover_instances).to eq({})
-    end
+    after { settings_tree.replace({}) }
 
-    it 'discovers a :local instance when port 8000 is reachable' do
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:socket_open?)
-        .with('localhost', 8000, timeout: 0.1).and_return(true)
-
-      instances = described_class.discover_instances
-
-      expect(instances[:local]).to eq(base_url: 'http://localhost:8000', tier: :local, capabilities: [:completion])
+    it 'never fabricates instances by port-scanning' do
+      # With no instances configured, only the registered top-level
+      # endpoint default surfaces — never a socket-probe result.
+      settings_tree.replace({})
+      expect(described_class.discover_instances.keys).to eq([:local])
     end
 
     it 'discovers named instances from extension settings' do
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
-        .with(:extensions, :llm, :mlx, :instances)
-        .and_return({ gpu1: { base_url: 'http://gpu1:8080' } })
+      settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080' } })
       instances = described_class.discover_instances
-      expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080', tier: :direct)
+      expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080', tier: :local)
     end
 
     it 'removes base_url key after normalization' do
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
-        .with(:extensions, :llm, :mlx, :instances)
-        .and_return({ gpu1: { base_url: 'http://gpu1:8080' } })
+      settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080' } })
       instances = described_class.discover_instances
       expect(instances[:gpu1]).not_to have_key(:base_url)
     end
 
     it 'normalizes OpenAI-compatible /v1 settings roots' do
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
-        .with(:extensions, :llm, :mlx, :instances)
-        .and_return({ gpu1: { base_url: 'http://gpu1:8080/v1', api_key: 'mlx-key' } })
+      settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080/v1', api_key: 'mlx-key' } })
       instances = described_class.discover_instances
-      expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080', mlx_api_key: 'mlx-key', tier: :direct)
+      expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080', mlx_api_key: 'mlx-key', tier: :local)
     end
 
-    it 'combines local and settings instances' do
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:socket_open?)
-        .with('localhost', 8000, timeout: 0.1).and_return(true)
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
-        .with(:extensions, :llm, :mlx, :instances).and_return({ remote: { base_url: 'http://remote:8080' } })
-      expect(described_class.discover_instances.keys).to contain_exactly(:local, :remote)
+    it 'preserves an explicit operator tier instead of forcing one' do
+      settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080', tier: :direct } })
+      instances = described_class.discover_instances
+      expect(instances[:gpu1][:tier]).to eq(:direct)
+    end
+
+    it 'is the single source shared by the fleet responder enablement check' do
+      fleet = { respond_to_requests: true }
+      settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080', fleet: fleet } })
+      expect(Legion::Extensions::Llm::Fleet::ProviderResponder.enabled_for?(described_class.discover_instances))
+        .to be(true)
     end
   end
 

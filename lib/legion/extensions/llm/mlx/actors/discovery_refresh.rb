@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
 require 'digest'
+require 'time'
 require 'uri'
+require 'faraday'
 
 begin
   require 'legion/extensions/actors/every'
@@ -9,7 +11,12 @@ rescue LoadError => e
   warn(e.message) if $VERBOSE
 end
 
+unless defined?(Legion::Extensions::Actors::Every)
+  raise LoadError, 'LegionIO actor runtime is required for MLX discovery refresh'
+end
+
 require 'legion/extensions/llm/inventory/publisher'
+require 'legion/extensions/llm/inventory/scoped_refresher'
 require 'legion/extensions/llm/inventory/identity'
 require 'legion/extensions/llm/inventory/records'
 require 'legion/extensions/llm/inventory/evidence'
@@ -17,8 +24,7 @@ require 'legion/extensions/llm/inventory/probe_coordinator'
 require 'legion/extensions/llm/routing/provider_outcome'
 require 'legion/extensions/llm/taxonomies'
 require 'legion/extensions/llm/capabilities'
-
-return unless defined?(Legion::Extensions::Actors::Every)
+require 'legion/extensions/llm/mlx/provider'
 
 module Legion
   module Extensions
@@ -169,13 +175,21 @@ module Legion
           end
 
           # Model-discovery and offering-assembly — included by DiscoveryRefresh.
+          #
+          # Rescue discipline (D16): only network and response-parse errors
+          # are runtime conditions that may yield no offerings — an
+          # unreachable /v1/models is a probe outcome, not a bug. Programming
+          # errors (NameError/NoMethodError/ArgumentError) are NOT rescued
+          # here: converting them to [] would publish zero offerings and make
+          # a healthy instance invisible. They propagate to the per-instance
+          # isolation in the tick, which logs and retries next tick.
           module OfferingAssembly
             private
 
             def discover_offerings_for_instance(instance_cfg:, instance_key:)
-              models = fetch_models(instance_cfg: instance_cfg)
+              fetch_models(instance_cfg: instance_cfg).filter_map do |model_data|
+                next unless model_data.is_a?(Hash)
 
-              models.filter_map do |model_data|
                 model_id = model_data[:id].to_s
                 next if model_id.empty?
 
@@ -184,16 +198,17 @@ module Legion
                   instance_cfg: instance_cfg, instance_key: instance_key
                 )
               end
-            rescue StandardError => e
-              handle_exception(e, level: :warn, operation: 'mlx.actor.discover_offerings')
-              []
             end
 
             def fetch_models(instance_cfg:)
               base_url = normalize_api_base(instance_cfg[:mlx_api_base] || instance_cfg[:endpoint])
               conn = build_api_connection(base_url: base_url, instance_cfg: instance_cfg)
-              response = conn.get('/v1/models')
-              Legion::JSON.load(response.body).fetch(:data, [])
+              parsed = Legion::JSON.load(conn.get('/v1/models').body)
+              data = parsed.is_a?(Hash) ? parsed[:data] : nil
+              data.is_a?(Array) ? data : []
+            rescue Faraday::Error, Legion::JSON::ParseError => e
+              handle_exception(e, level: :warn, handled: true, operation: 'mlx.actor.fetch_models')
+              []
             end
           end
 
@@ -291,34 +306,113 @@ module Legion
             end
           end
 
-          # Periodic refresh cycle — included by DiscoveryRefresh.
+          # Periodic refresh cycle — included by DiscoveryRefresh. Each tick
+          # re-scans the configured instances (late configuration appears
+          # without a restart; removed instances are reconciled out),
+          # re-activates instances still initializing after an initial
+          # readiness failure, and refreshes offerings + cadence probes for
+          # activated instances.
           module TickCycle
             private
 
             def tick_refresh
-              @instance_states.each do |instance_id, state|
-                refresh_instance(instance_id: instance_id, state: state)
+              @instance_states ||= {}
+              configured_ids = {}
+              configured_instances.each do |name, instance_cfg|
+                instance_id = derive_instance_id(instance_cfg: instance_cfg)
+                configured_ids[instance_id] = true
+                state = @instance_states[instance_id]
+                if state.nil?
+                  claim_and_activate_instance(name: name, instance_cfg: instance_cfg)
+                else
+                  refresh_instance(instance_id: instance_id, name: name, state: state)
+                end
               rescue StandardError => e
-                handle_exception(e, level: :warn, operation: 'mlx.actor.refresh_instance',
+                handle_exception(e, level: :warn, operation: 'mlx.actor.tick_refresh', instance_name: name.to_s)
+              end
+
+              remove_unconfigured_instances(configured_ids: configured_ids)
+            end
+
+            def remove_unconfigured_instances(configured_ids:)
+              @instance_states.each do |instance_id, state|
+                next if configured_ids.key?(instance_id)
+
+                remove_instance_state(instance_id: instance_id, state: state)
+              rescue StandardError => e
+                handle_exception(e, level: :warn, operation: 'mlx.actor.remove_instance_state',
                                     instance_id: instance_id)
               end
             end
 
-            def refresh_instance(instance_id:, state:)
+            def remove_instance_state(instance_id:, state:)
+              publisher.remove_instance(instance_id: instance_id, publisher_token: state[:publisher_token])
+              clear_instance_health(config_name: state[:name])
+              @instance_states.delete(instance_id)
+            end
+
+            def refresh_instance(instance_id:, name:, state:)
+              status = publisher.snapshot.publication_status(instance_key: state[:instance_key])
+              if status.state == :initializing
+                reactivate_if_ready(instance_id: instance_id, name: name, state: state)
+                return
+              end
+
+              replace_offerings_if_changed(instance_id: instance_id, state: state)
+              run_cadence_probe(instance_id: instance_id, state: state)
+              write_instance_health(config_name: name, state: state)
+            end
+
+            def replace_offerings_if_changed(instance_id:, state:)
               new_offerings = discover_offerings_for_instance(
                 instance_cfg: state[:instance_cfg], instance_key: state[:instance_key]
               )
+              return if new_offerings == state[:offerings]
 
-              if new_offerings != state[:offerings]
-                state[:sequence] += 1
-                publisher.replace_instance_snapshot(
+              state[:sequence] += 1
+              publisher.replace_instance_snapshot(
+                instance_id: instance_id, publisher_token: state[:publisher_token],
+                offerings: new_offerings, sequence: state[:sequence]
+              )
+              state[:offerings] = new_offerings
+            end
+
+            # Initial-failure recovery: an instance stuck at :initializing
+            # (readiness failed at boot, e.g. transient outage) re-activates
+            # on the first healthy probe. While :initializing,
+            # replace_instance_snapshot and readiness_succeeded are invalid
+            # transitions — activate_instance_snapshot is the only legal
+            # commit, so the cadence probe path is not usable here.
+            def reactivate_if_ready(instance_id:, name:, state:)
+              offerings = discover_offerings_for_instance(
+                instance_cfg: state[:instance_cfg], instance_key: state[:instance_key]
+              )
+              probe_token = publisher.readiness_probe_started(
+                instance_id: instance_id, publisher_token: state[:publisher_token]
+              )
+              readiness = check_health(instance_cfg: state[:instance_cfg])
+              commit_readiness(instance_id: instance_id, offerings: offerings,
+                               probe_token: probe_token, readiness: readiness, state: state)
+              write_instance_health(config_name: name, state: state)
+            end
+
+            # Shared commit for initial and recovery activation: on a
+            # healthy probe activate the snapshot (the only legal commit
+            # from :initializing), otherwise record the failed readiness.
+            # The sequence is the instance state's sequence (0 until the
+            # first replace after activation).
+            def commit_readiness(instance_id:, offerings:, probe_token:, readiness:, state:)
+              if readiness.ready?
+                publisher.activate_instance_snapshot(
                   instance_id: instance_id, publisher_token: state[:publisher_token],
-                  offerings: new_offerings, sequence: state[:sequence]
+                  offerings: offerings, sequence: state[:sequence], probe_token: probe_token
                 )
-                state[:offerings] = new_offerings
+                state[:offerings] = offerings
+              else
+                publisher.readiness_failed(
+                  instance_id: instance_id, probe_token: probe_token, reason: readiness.reason
+                )
               end
-
-              run_cadence_probe(instance_id: instance_id, state: state)
             end
           end
 
@@ -327,52 +421,11 @@ module Legion
             private
 
             def settings
-              Legion::Settings[:extensions][:llm][:mlx]
+              Legion::Settings.dig(:extensions, :llm, :mlx) || {}
             end
 
             def configured_instances
-              instances = {}
-              cfg_instances = settings[:instances]
-              if cfg_instances.is_a?(Hash)
-                cfg_instances.each do |name, config|
-                  instances[name.to_sym] = normalize_instance_config(config: config)
-                end
-              end
-
-              if instances.empty?
-                instances[:local] = {
-                  mlx_api_base: settings[:endpoint],
-                  tier: :local,
-                  mlx_api_key: settings[:credentials][:api_key]
-                }
-              end
-
-              instances
-            end
-
-            def normalize_instance_config(config:)
-              normalized = config.to_h.transform_keys(&:to_sym)
-              resolve_api_base(normalized: normalized)
-              resolve_instance_credentials(normalized: normalized)
-              normalized[:tier] ||= :local
-              normalized
-            end
-
-            def resolve_api_base(normalized:)
-              normalized[:mlx_api_base] ||= normalized.delete(:base_url)
-              normalized[:mlx_api_base] ||= normalized.delete(:api_base)
-              normalized[:mlx_api_base] ||= normalized.delete(:endpoint)
-              return unless normalized[:mlx_api_base]
-
-              normalized[:mlx_api_base] = normalized[:mlx_api_base].to_s.sub(%r{/v1/?\z}, '')
-            end
-
-            def resolve_instance_credentials(normalized:)
-              creds = normalized.delete(:credentials)
-              return unless creds.is_a?(Hash)
-
-              creds = creds.transform_keys(&:to_sym)
-              normalized[:mlx_api_key] ||= creds[:api_key]
+              Legion::Extensions::Llm::Mlx.configured_instances
             end
 
             def derive_instance_id(instance_cfg:)
@@ -416,6 +469,88 @@ module Legion
             end
           end
 
+          # Display-only health/capabilities written into the settings tree
+          # after each registry commit. Routing authority stays in the
+          # in-memory Registry; this hash exists so the status API
+          # (legion-llm /api/llm/providers) renders per-instance health.
+          # Keyed by the operator's config name, not the derived instance_id.
+          module HealthDisplay
+            HEALTH_SOURCE = :provider_probe
+
+            private
+
+            def write_instance_health(config_name:, state:)
+              instance_settings = settings[:instances]
+              return unless instance_settings.is_a?(Hash) && instance_settings[config_name].is_a?(Hash)
+
+              instance_settings[config_name][:health] = build_health_hash(state: state)
+              instance_settings[config_name][:capabilities] = build_display_capabilities(state: state)
+            rescue StandardError => e
+              handle_exception(e, level: :warn, operation: 'mlx.actor.write_instance_health',
+                                  instance_name: config_name.to_s)
+            end
+
+            def clear_instance_health(config_name:)
+              instance_settings = settings[:instances]
+              return unless instance_settings.is_a?(Hash) && instance_settings[config_name].is_a?(Hash)
+
+              instance_settings[config_name].delete(:health)
+              instance_settings[config_name].delete(:capabilities)
+            rescue StandardError => e
+              handle_exception(e, level: :warn, operation: 'mlx.actor.clear_instance_health',
+                                  instance_name: config_name.to_s)
+            end
+
+            def build_health_hash(state:)
+              instance_key = state[:instance_key]
+              status = publisher.snapshot.publication_status(instance_key: instance_key)
+              availability = publisher.snapshot.instance(instance_key: instance_key)&.availability
+              {
+                circuit_state: health_circuit_state(availability),
+                denied: false,
+                available: health_available?(availability),
+                adjustment: health_adjustment(availability),
+                reason: health_display_reason(status: status, availability: availability),
+                observed_at: health_observed_at(status: status, availability: availability),
+                last_probe_outcome: status.last_probe_outcome,
+                source: HEALTH_SOURCE
+              }
+            end
+
+            def health_available?(availability)
+              !availability.nil? && availability.state == :available
+            end
+
+            def health_circuit_state(availability)
+              health_available?(availability) ? :closed : :open
+            end
+
+            def health_adjustment(availability)
+              health_available?(availability) ? 0 : -50
+            end
+
+            def health_observed_at(status:, availability:)
+              # getutc (not utc): the registry freezes its Time objects, and
+              # Time#utc mutates the receiver in place.
+              (availability&.observed_at || status.last_probe_completed_at || Time.now).getutc.iso8601
+            end
+
+            def health_display_reason(status:, availability:)
+              return availability.reason if availability&.reason
+              return status.last_error if status.last_error
+
+              'awaiting initial readiness'
+            end
+
+            def build_display_capabilities(state:)
+              state[:offerings].each_with_object(Hash.new(false)) do |draft, supported|
+                draft.capability_evidence.each do |capability, evidence|
+                  supported[capability] = true if evidence.supported?
+                end
+              end.keys.sort
+            end
+          end
+
           # HTTP connection builders — included by DiscoveryRefresh.
           module HttpConnections
             private
@@ -425,7 +560,6 @@ module Legion
             end
 
             def build_health_connection(base_url:, instance_cfg:)
-              require 'faraday'
               Faraday.new(url: base_url) do |f|
                 f.options.timeout = 5
                 f.options.open_timeout = 3
@@ -435,7 +569,6 @@ module Legion
             end
 
             def build_api_connection(base_url:, instance_cfg:)
-              require 'faraday'
               Faraday.new(url: base_url) do |f|
                 f.options.timeout = 15
                 f.options.open_timeout = 5
@@ -454,10 +587,11 @@ module Legion
           end
 
           # SSOT v3 periodic discovery actor for MLX provider instances.
-          # Claims instances, discovers models via /v1/models, probes health
-          # via /health, and publishes complete OfferingDraft snapshots through
-          # the Inventory::Publisher. Supports coalesced reactive probes after
-          # dispatch-triggered instance_unavailable transitions.
+          # Claims configured instances, discovers models via /v1/models,
+          # probes health via /health, and publishes complete OfferingDraft
+          # snapshots through the Inventory::Publisher. Supports coalesced
+          # reactive probes after dispatch-triggered instance_unavailable
+          # transitions.
           class DiscoveryRefresh < Legion::Extensions::Actors::Every
             include Legion::Logging::Helper
             include EvidenceBuilding
@@ -466,9 +600,14 @@ module Legion
             include HealthProbing
             include TickCycle
             include InstanceConfig
+            include HealthDisplay
             include HttpConnections
 
-            def self.every_seconds = 60
+            # Mirrors the registered lex-llm default
+            # (discovery.interval_seconds); used only when the settings tree
+            # has no discovery section. time must never return nil — a
+            # TimerTask with a nil interval fires exactly once and stops.
+            DEFAULT_DISCOVERY_INTERVAL_SECONDS = 300
 
             def runner_class    = self.class
             def runner_function = 'manual'
@@ -478,16 +617,12 @@ module Legion
             def generate_task?  = false
 
             def time
-              settings[:discovery_interval] || self.class.every_seconds
+              interval = settings.dig(:discovery, :interval_seconds)
+              interval.is_a?(Integer) && interval.positive? ? interval : DEFAULT_DISCOVERY_INTERVAL_SECONDS
             end
 
             def manual
-              if @initialized
-                tick_refresh
-              else
-                initial_discovery
-                @initialized = true
-              end
+              tick_refresh
             rescue StandardError => e
               handle_exception(e, level: :warn, operation: 'mlx.actor.discovery_refresh')
             end
@@ -501,22 +636,18 @@ module Legion
             private
 
             def publisher
-              @publisher ||= Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
-            end
-
-            def initial_discovery
-              @instance_states = {}
-              configured_instances.each do |name, instance_cfg|
-                claim_and_activate_instance(name: name, instance_cfg: instance_cfg)
-              rescue StandardError => e
-                handle_exception(e, level: :warn, operation: 'mlx.actor.claim_instance', instance_name: name.to_s)
-              end
+              @publisher ||= Legion::Extensions::Llm::Inventory::Publisher.new(
+                provider_family: :mlx,
+                compatibility_adapter: Legion::Extensions::Llm::Inventory::ScopedRefresher::LegacyCoordinatorAdapter.new(
+                  provider_family: :mlx
+                )
+              )
             end
 
             def claim_and_activate_instance(name:, instance_cfg:)
               instance_id = derive_instance_id(instance_cfg: instance_cfg)
               instance_key = build_instance_key(instance_id: instance_id)
-              callable = MlxCallable.new(instance_cfg: instance_cfg, logger: log)
+              callable = Legion::Extensions::Llm::Mlx::Actor::MlxCallable.new(instance_cfg: instance_cfg, logger: log)
               probe_coordinator = build_probe_coordinator(instance_id: instance_id, instance_key: instance_key)
               publisher_token = publisher.claim_instance(
                 instance_id: instance_id, callable: callable, probe_request_handle: probe_coordinator
@@ -535,20 +666,13 @@ module Legion
               probe_token = publisher.readiness_probe_started(instance_id: instance_id,
                                                               publisher_token: publisher_token)
               readiness = check_health(instance_cfg: instance_cfg)
-
-              if readiness.ready?
-                publisher.activate_instance_snapshot(
-                  instance_id: instance_id, publisher_token: publisher_token,
-                  offerings: offerings, sequence: 0, probe_token: probe_token
-                )
-              else
-                publisher.readiness_failed(instance_id: instance_id, probe_token: probe_token,
-                                           reason: readiness.reason)
-              end
-
-              @instance_states[instance_id] = build_instance_state(
+              state = build_instance_state(
                 **instance_desc, publisher_token: publisher_token, offerings: offerings
               )
+              commit_readiness(instance_id: instance_id, offerings: offerings,
+                               probe_token: probe_token, readiness: readiness, state: state)
+              @instance_states[instance_id] = state
+              write_instance_health(config_name: instance_desc[:name], state: state)
             end
 
             def remove_all_instances
@@ -558,6 +682,7 @@ module Legion
                 publisher.remove_instance(
                   instance_id: instance_id, publisher_token: state[:publisher_token]
                 )
+                clear_instance_health(config_name: state[:name])
               rescue StandardError => e
                 handle_exception(e, level: :warn, operation: 'mlx.actor.remove_instance',
                                     instance_id: instance_id)
@@ -566,14 +691,31 @@ module Legion
             end
           end
 
-          # Callable wrapper for an MLX provider instance. Implements the
-          # `disconnect` and `normalize_dispatch_error(error:)` contracts
-          # required by Inventory::CallableHandle and Routing::ProviderOutcome.
+          # Callable wrapper for an MLX provider instance. It is the
+          # exact-execution dispatch target: it implements the fleet dispatch
+          # operations (chat, stream_chat, embed, count_tokens) by delegating
+          # to a per-instance Mlx::Provider built from the instance config,
+          # plus the `disconnect` and `normalize_dispatch_error(error:)`
+          # contracts required by Inventory::CallableHandle and
+          # Routing::ProviderOutcome. Provider and Faraday errors are NOT
+          # rescued here so the coordinator's normalize_dispatch_error can
+          # classify them.
           class MlxCallable
+            # Keys the base Provider exposes as named kwargs for the
+            # completion operations. Anything else the fleet passes is folded
+            # into the payload `params` hash.
+            COMPLETION_NAMED_KEYS = %i[tools temperature schema thinking tool_prefs headers].freeze
+            EMBED_NAMED_KEYS = %i[dimensions headers].freeze
+
             def initialize(instance_cfg:, logger:)
               @instance_cfg = instance_cfg
               @logger = logger
               @disconnected = false
+              @inference_calls = 0
+            end
+
+            def call_count
+              @inference_calls
             end
 
             def disconnected?
@@ -582,7 +724,34 @@ module Legion
 
             def disconnect
               @disconnected = true
+              @provider&.disconnect
               @logger.debug { '[mlx][callable] disconnected' }
+            end
+
+            # ── Fleet dispatch operations ───────────────────────────────────
+
+            def chat(messages:, model:, **rest)
+              record_inference
+              named, params = split_fleet_kwargs(rest, COMPLETION_NAMED_KEYS)
+              provider.chat(messages: messages, model: model_info(model), params: params, **named)
+            end
+
+            def stream_chat(messages:, model:, **rest, &)
+              record_inference
+              named, params = split_fleet_kwargs(rest, COMPLETION_NAMED_KEYS)
+              provider.stream_chat(messages: messages, model: model_info(model), params: params, **named, &)
+            end
+
+            def embed(text:, model:, **rest)
+              record_inference
+              named, params = split_fleet_kwargs(rest, EMBED_NAMED_KEYS)
+              provider.embed(text: text, model: model_info(model), params: params, **named)
+            end
+
+            def count_tokens(messages:, model:, **rest)
+              record_inference
+              _named, params = split_fleet_kwargs(rest, [])
+              provider.count_tokens(messages: messages, model: model, params: params)
             end
 
             def normalize_dispatch_error(error:)
@@ -596,6 +765,35 @@ module Legion
             end
 
             private
+
+            def record_inference
+              @inference_calls += 1
+            end
+
+            def provider
+              @provider ||= Legion::Extensions::Llm::Mlx::Provider.new(@instance_cfg)
+            end
+
+            # The fleet passes the model as a bare string; the base Provider's
+            # payload renderer needs a Model::Info (model.id). Wrap strings
+            # only — pass through anything already carrying model identity.
+            def model_info(model)
+              return model if model.respond_to?(:id)
+
+              Legion::Extensions::Llm::Model::Info.new(
+                id: model.to_s, provider: Legion::Extensions::Llm::Mlx::PROVIDER_FAMILY
+              )
+            end
+
+            # Split the fleet's **rest into the base Provider's named kwargs
+            # and a payload params hash (any passed :params merged with
+            # unknown keys).
+            def split_fleet_kwargs(rest, named_keys)
+              named = rest.slice(*named_keys)
+              extra = rest.reject { |key, _| named.key?(key) }
+              params = (extra.delete(:params) || {}).to_h.merge(extra)
+              [named, params]
+            end
 
             def classify_error_kind(error:)
               case error

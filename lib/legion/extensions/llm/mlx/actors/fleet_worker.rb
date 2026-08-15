@@ -20,14 +20,19 @@ module Legion
         module Actor
           # Subscription actor for MLX fleet request consumption.
           class FleetWorker < Legion::Extensions::Actors::Subscription
+            # The runner module as a constant: the Subscription dispatch
+            # path calls `runner_class.send(runner_function, **message)`,
+            # which a String cannot receive.
             def runner_class
-              'Legion::Extensions::Llm::Mlx::Runners::FleetWorker'
+              Legion::Extensions::Llm::Mlx::Runners::FleetWorker
             end
 
             def runner_function
               'handle_fleet_request'
             end
 
+            # Call the runner module directly — no task record per
+            # inference hop.
             def use_runner?
               false
             end

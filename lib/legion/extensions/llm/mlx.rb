@@ -3,7 +3,7 @@
 require 'legion/extensions/llm'
 require 'legion/extensions/llm/mlx/provider'
 require 'legion/extensions/llm/mlx/version'
-require_relative 'mlx/actors/discovery_refresh'
+require 'legion/extensions/llm/mlx/actors/discovery_refresh'
 
 module Legion
   module Extensions
@@ -39,37 +39,40 @@ module Legion
           Provider
         end
 
+        # Single source of truth for MLX instance discovery. The SSOT
+        # discovery actor and the fleet responder both read this: only
+        # operator-configured instances (plus the registered top-level
+        # endpoint default when no instances are configured at all).
+        # No port-scanning, no fabricated instances, no tier override.
         def self.discover_instances
-          instances = {}
-          discover_local_instance(instances)
-          discover_settings_instances(instances)
-          instances
+          configured_instances
         end
 
-        def self.discover_local_instance(instances)
-          return unless CredentialSources.socket_open?('localhost', 8000, timeout: 0.1)
+        def self.configured_instances
+          provider_cfg = Legion::Settings.dig(:extensions, :llm, :mlx) || {}
+          instances = {}
+          cfg_instances = provider_cfg[:instances]
+          if cfg_instances.is_a?(Hash)
+            cfg_instances.each { |name, config| instances[name.to_sym] = normalize_instance_config(config) }
+          end
+
+          return instances unless instances.empty?
 
           instances[:local] = {
-            base_url: 'http://localhost:8000',
+            mlx_api_base: provider_cfg[:endpoint],
             tier: :local,
-            capabilities: [:completion]
+            mlx_api_key: provider_cfg.dig(:credentials, :api_key)
           }
-        end
-
-        def self.discover_settings_instances(instances)
-          cfg = CredentialSources.setting(:extensions, :llm, :mlx, :instances)
-          return unless cfg.is_a?(Hash)
-
-          cfg.each do |name, config|
-            instances[name.to_sym] = normalize_instance_config(config).merge(tier: :direct)
-          end
+          instances
         end
 
         def self.normalize_instance_config(config)
           normalized = config.to_h.transform_keys(&:to_sym)
           promote_api_base_aliases(normalized)
-          normalized[:mlx_api_key] ||= normalized.delete(:api_key)
           normalized[:mlx_api_base] = normalize_api_base(normalized[:mlx_api_base]) if normalized[:mlx_api_base]
+          normalized[:mlx_api_key] ||= normalized.delete(:api_key)
+          resolve_instance_credentials(normalized)
+          normalized[:tier] ||= :local
           normalized.compact
         end
 
@@ -83,8 +86,15 @@ module Legion
           url.to_s.sub(%r{/v1/?\z}, '')
         end
 
-        private_class_method :discover_local_instance, :discover_settings_instances,
-                             :normalize_instance_config, :promote_api_base_aliases, :normalize_api_base
+        def self.resolve_instance_credentials(normalized)
+          creds = normalized.delete(:credentials)
+          return unless creds.is_a?(Hash)
+
+          normalized[:mlx_api_key] ||= creds.transform_keys(&:to_sym)[:api_key]
+        end
+
+        private_class_method :normalize_instance_config, :promote_api_base_aliases, :normalize_api_base,
+                             :resolve_instance_credentials
 
         Legion::Extensions::Llm::Configuration.register_provider_options(Provider.configuration_options)
       end

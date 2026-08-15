@@ -3,7 +3,6 @@
 require 'spec_helper'
 require 'faraday'
 require 'digest'
-require 'uri'
 
 require 'legion/extensions/llm/inventory/publisher'
 require 'legion/extensions/llm/inventory/registry'
@@ -25,149 +24,32 @@ require 'legion/extensions/llm/mlx/actors/discovery_refresh'
 # the firewall rule (Faraday::ConnectionFailed must NOT become instance_unavailable).
 class MlxTestInstanceUnavailableError < StandardError; end
 
-# Test-local callable that extends MlxCallable with dispatch operations
-# required by FleetWorkerExecution. Tracks inference call count for
-# conformance assertions.
-class TrackingMlxCallable < Legion::Extensions::Llm::Mlx::Actor::MlxCallable
-  attr_reader :call_count
-
-  def initialize(instance_cfg:, logger:)
-    super
-    @call_count = 0
-  end
-
-  def chat(model:, **)
-    @call_count += 1
-    { role: 'assistant', content: 'test response', model: model }
-  end
-
-  def stream_chat(model:, **)
-    @call_count += 1
-    { role: 'assistant', content: 'streamed response', model: model }
-  end
-
-  def embed(model:, **)
-    @call_count += 1
-    { embedding: [0.1, 0.2, 0.3], model: model }
-  end
-
-  def count_tokens(model:, **)
-    @call_count += 1
-    { token_count: 42, model: model }
-  end
-
-  def normalize_dispatch_error(error:)
-    reason = error.message.to_s[0, 512]
-    kind = classify_dispatch_error(error: error)
-
-    Legion::Extensions::Llm::Routing::ProviderOutcome.new(
-      kind: kind,
-      reason: reason.empty? ? 'unknown dispatch error' : reason
-    )
-  end
-
-  private
-
-  def classify_dispatch_error(error:)
-    case error
-    when MlxTestInstanceUnavailableError then :instance_unavailable
-    when Faraday::ConnectionFailed then :connection_failure
-    when Faraday::TimeoutError then :timeout
-    when Faraday::ClientError then classify_client_error_ext(error: error)
-    when Faraday::ServerError then classify_server_error_ext(error: error)
-    when Legion::Extensions::Llm::OverloadedError then :overloaded
-    else :provider_error
-    end
-  end
-
-  def classify_client_error_ext(error:)
-    status = error.respond_to?(:response_status) ? error.response_status : nil
-    case status
-    when 401 then :authentication
-    when 403 then :authorization
-    when 404 then :model_missing
-    when 429 then :rate_limited
-    else :invalid_request
-    end
-  end
-
-  def classify_server_error_ext(error:)
-    status = error.respond_to?(:response_status) ? error.response_status : nil
-    case status
-    when 503, 529 then :overloaded
-    else :provider_error
-    end
-  end
-end
-
-# Evidence-building helpers for the SSOT v3 conformance harness.
-# Extracted to keep MlxSsotHarness within class length limits.
-module MlxSsotEvidenceHelpers
-  EMBEDDING_PATTERN = /embed|bge|e5|nomic/i
-
-  private
-
-  def build_operation_evidence(now:, model_id:)
-    is_embedding = model_id.to_s.match?(EMBEDDING_PATTERN)
+# Canned OpenAI-compatible chat-completion body for the stubbed
+# Connection#post boundary. String keys, as the faraday :json middleware
+# produces in production.
+STUB_COMPLETION_BODY = {
+  'id' => 'chatcmpl-ssot-stub',
+  'model' => 'mlx-community/Llama-3.2-3B-Instruct-4bit',
+  'choices' => [
     {
-      chat: op_evidence(:chat, is_embedding ? :unsupported : :supported, now),
-      stream_chat: op_evidence(:stream_chat, is_embedding ? :unsupported : :supported, now),
-      embed: op_evidence(:embed, is_embedding ? :supported : :unsupported, now),
-      image: op_evidence(:image, :unsupported, now),
-      transcribe: op_evidence(:transcribe, :unsupported, now),
-      translate: op_evidence(:translate, :unsupported, now),
-      speak: op_evidence(:speak, :unsupported, now),
-      moderate: op_evidence(:moderate, :unsupported, now),
-      count_tokens: op_evidence(:count_tokens, :unknown, now)
+      'index' => 0,
+      'message' => { 'role' => 'assistant', 'content' => 'ssot stub response' },
+      'finish_reason' => 'stop'
     }
-  end
-
-  def op_evidence(operation, status, observed_at)
-    source = status == :unknown ? :default_false : :provider_implementation
-    Legion::Extensions::Llm::Inventory::OperationEvidence.new(
-      operation: operation, status: status, source: source, observed_at: observed_at
-    )
-  end
-
-  def build_capability_evidence(model_id:)
-    is_embedding = model_id.to_s.match?(EMBEDDING_PATTERN)
-    caps = {
-      completion: Legion::Extensions::Llm::Inventory::CapabilityEvidence.new(
-        capability: :completion, status: is_embedding ? :unsupported : :supported,
-        source: :provider_implementation, observed_at: Time.now
-      ),
-      streaming: Legion::Extensions::Llm::Inventory::CapabilityEvidence.new(
-        capability: :streaming, status: is_embedding ? :unsupported : :supported,
-        source: :provider_implementation, observed_at: Time.now
-      ),
-      tools: Legion::Extensions::Llm::Inventory::CapabilityEvidence.new(
-        capability: :tools, status: :unknown, source: :default_false, observed_at: Time.now
-      ),
-      thinking: Legion::Extensions::Llm::Inventory::CapabilityEvidence.new(
-        capability: :thinking, status: :unknown, source: :default_false, observed_at: Time.now
-      )
-    }
-
-    if is_embedding
-      caps[:embedding] = Legion::Extensions::Llm::Inventory::CapabilityEvidence.new(
-        capability: :embedding, status: :supported, source: :provider_implementation, observed_at: Time.now
-      )
-    end
-
-    caps
-  end
-
-  def extract_host_port(base_url:)
-    uri = URI.parse(base_url.to_s)
-    "#{uri.host || 'localhost'}:#{uri.port}"
-  end
-end
+  ],
+  'usage' => { 'prompt_tokens' => 1, 'completion_tokens' => 2, 'total_tokens' => 3 }
+}.freeze
 
 # Harness class for MLX SSOT v3 conformance testing. Implements the full
 # interface required by the shared conformance examples without touching
-# any external service.
+# any external service. build_callable returns the PRODUCTION callable
+# (the only stub is the HTTP boundary, so dispatch ops run the real
+# per-instance Provider path offline), and draft-building + identity
+# DELEGATE to the production actor's real methods — no harness-side
+# copies of the builders (D16).
 class MlxSsotHarness
-  include MlxSsotEvidenceHelpers
+  ACTOR = Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh
+  HARNESS_INSTANCE_ID = 'mac-studio-1.local:8000'
 
   INSTANCE_CONFIGS = [
     {
@@ -183,24 +65,21 @@ class MlxSsotHarness
   def provider_family = :mlx
   def instance_configs = INSTANCE_CONFIGS
 
+  # Identity delegates to the production actor's derive_instance_id —
+  # the harness must not drift from the ID the actor actually claims.
   def instance_id(instance_config:)
-    base_url = instance_config[:mlx_api_base] || instance_config[:endpoint] || 'http://localhost:8000'
-    host_port = extract_host_port(base_url: base_url)
-    api_key = instance_config[:mlx_api_key] || instance_config.dig(:credentials, :api_key)
-
-    return host_port unless api_key.is_a?(String) && !api_key.strip.empty?
-
-    "#{host_port}/ak:#{::Digest::SHA256.hexdigest(api_key)[0, 6]}"
+    ACTOR.new.send(:derive_instance_id, instance_cfg: instance_config)
   end
 
   def build_callable(instance_config:)
-    TrackingMlxCallable.new(instance_cfg: instance_config, logger: Logger.new(File::NULL))
+    Legion::Extensions::Llm::Mlx::Actor::MlxCallable.new(instance_cfg: instance_config, logger: Logger.new(File::NULL))
   end
 
+  # Drafts are built by the production path — the actor's real
+  # build_offering_draft (EvidenceBuilding) — not a harness-side copy.
   def build_offering_drafts(tier: :local, **)
-    now = Time.now.freeze
     model_id = 'mlx-community/Llama-3.2-3B-Instruct-4bit'
-    [build_single_offering(model_id: model_id, tier: tier, now: now)]
+    [production_draft(model_id: model_id, tier: tier)]
   end
 
   def safe_readiness(instance_config:, **)
@@ -216,9 +95,23 @@ class MlxSsotHarness
   end
 
   def normalize_dispatch_error(error:)
+    # The synthetic explicit-unavailable sentinel is a test-only signal;
+    # the production classifier never sees it in the field, so the harness
+    # maps it here. Everything else goes through the production callable.
+    if error.is_a?(MlxTestInstanceUnavailableError)
+      return Legion::Extensions::Llm::Routing::ProviderOutcome.new(
+        kind: :instance_unavailable,
+        reason: error.message.to_s[0, 512]
+      )
+    end
+
     callable = build_callable(instance_config: instance_configs.first)
     outcome = callable.normalize_dispatch_error(error: error)
     apply_mlx_escalation(outcome: outcome, error: error)
+  end
+
+  def stub_completion_response
+    Faraday::Response.new(status: 200, body: STUB_COMPLETION_BODY)
   end
 
   def instance_unavailable_error
@@ -252,23 +145,15 @@ class MlxSsotHarness
     body.include?('model not ready') || body.include?('model is still loading')
   end
 
-  def build_single_offering(model_id:, tier:, now:)
-    Legion::Extensions::Llm::Inventory::OfferingDraft.new(
-      provider_native_key: model_id, model: model_id, tier: tier,
-      operation_evidence: build_operation_evidence(now: now, model_id: model_id),
-      capability_evidence: build_capability_evidence(model_id: model_id),
-      context_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(
-        status: :unknown, source: :absent
-      ),
-      max_output_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
-      embedding_dimensions_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(
-        status: :unknown, source: :absent
-      ),
-      model_revision_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(
-        status: :unknown, source: :absent
-      ),
-      tokenizer_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
-      quota_domains: {}, metadata: { raw_model: model_id }, publication_source: :provider_catalog
+  def production_draft(model_id:, tier:)
+    ACTOR.new.send(
+      :build_offering_draft,
+      model_id: model_id,
+      model_data: { id: model_id, max_model_len: 32_768 },
+      instance_cfg: { mlx_api_base: "http://#{HARNESS_INSTANCE_ID}", tier: tier },
+      instance_key: Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
+        provider_family: :mlx, instance_id: HARNESS_INSTANCE_ID
+      )
     )
   end
 end
@@ -277,7 +162,17 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   let(:ssot_harness) { MlxSsotHarness.new }
   let(:registry) { Legion::Extensions::Llm::Inventory::Registry }
 
-  before { registry.reset! }
+  before do
+    registry.reset!
+    # The production callable dispatches through a real per-instance
+    # Mlx::Provider built lazily from the instance config; the only seam
+    # to run the dispatch ops offline is the shared HTTP boundary.
+    # rubocop:disable RSpec/AnyInstance -- the per-callable Provider is built lazily; the shared connection is the only offline seam
+    allow_any_instance_of(Legion::Extensions::Llm::Connection).to receive(:post) do |*_args|
+      ssot_harness.stub_completion_response
+    end
+    # rubocop:enable RSpec/AnyInstance
+  end
 
   it_behaves_like 'an SSOT v3 provider adapter'
 
@@ -307,11 +202,11 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       expect(first_call).to eq(second_call)
     end
 
-    it 'strips /v1 suffix from endpoint when computing identity' do
+    it 'derives identical identity with and without the /v1 suffix' do
       config_with_v1 = { mlx_api_base: 'http://mac-studio-1.local:8000/v1' }
       config_without = { mlx_api_base: 'http://mac-studio-1.local:8000' }
-      expect(URI.parse(config_with_v1[:mlx_api_base]).host).to eq(URI.parse(config_without[:mlx_api_base]).host)
-      expect(URI.parse(config_with_v1[:mlx_api_base]).port).to eq(URI.parse(config_without[:mlx_api_base]).port)
+      expect(ssot_harness.instance_id(instance_config: config_with_v1))
+        .to eq(ssot_harness.instance_id(instance_config: config_without))
     end
   end
 
@@ -451,14 +346,15 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       expect(offering.operation_evidence[:embed].status).to eq(:unsupported)
     end
 
-    it 'matches known embedding model names against the embedding pattern' do
-      pattern = MlxSsotEvidenceHelpers::EMBEDDING_PATTERN
+    # The pattern under test is the PRODUCTION constant, not a copy.
+    it 'matches known embedding model names against the production embedding pattern' do
+      pattern = Legion::Extensions::Llm::Mlx::Actor::EvidenceBuilding::EMBEDDING_PATTERN
       expect(pattern).to match('BAAI/bge-large-en-v1.5')
       expect(pattern).to match('nomic-ai/nomic-embed-text-v1.5')
     end
 
-    it 'does not match chat model names against the embedding pattern' do
-      pattern = MlxSsotEvidenceHelpers::EMBEDDING_PATTERN
+    it 'does not match chat model names against the production embedding pattern' do
+      pattern = Legion::Extensions::Llm::Mlx::Actor::EvidenceBuilding::EMBEDDING_PATTERN
       chat_model = 'mlx-community/Llama-3.2-3B-Instruct-4bit'
       expect(chat_model).not_to match(pattern)
     end
@@ -997,21 +893,17 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     private
 
+    # Delegates to the production draft path (actor's build_offering_draft);
+    # an empty model must be rejected by the OfferingDraft validation there.
     def build_empty_model_offering
-      now = Time.now.freeze
-      Legion::Extensions::Llm::Inventory::OfferingDraft.new(
-        provider_native_key: 'test', model: '', tier: :local,
-        operation_evidence: ssot_harness.send(:build_operation_evidence, now: now, model_id: 'test'),
-        context_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
-        max_output_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
-        embedding_dimensions_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(
-          status: :unknown, source: :absent
-        ),
-        model_revision_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(
-          status: :unknown, source: :absent
-        ),
-        tokenizer_evidence: Legion::Extensions::Llm::Inventory::ValueEvidence.new(status: :unknown, source: :absent),
-        quota_domains: {}, metadata: {}, publication_source: :provider_catalog
+      MlxSsotHarness::ACTOR.new.send(
+        :build_offering_draft,
+        model_id: '',
+        model_data: { id: '' },
+        instance_cfg: { mlx_api_base: "http://#{MlxSsotHarness::HARNESS_INSTANCE_ID}", tier: :local },
+        instance_key: Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
+          provider_family: :mlx, instance_id: MlxSsotHarness::HARNESS_INSTANCE_ID
+        )
       )
     end
   end
@@ -1054,7 +946,29 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     it 'truncates reason to 512 bytes' do
       long_message = 'x' * 1000
       outcome = callable.normalize_dispatch_error(error: RuntimeError.new(long_message))
-      expect(outcome.reason.length).to be <= 1024
+      expect(outcome.reason.length).to eq(512)
+    end
+
+    it 'exposes the fleet dispatch ops' do
+      %i[chat stream_chat embed count_tokens].each do |op|
+        expect(callable).to respond_to(op), "production callable must implement ##{op}"
+      end
+    end
+
+    it 'executes chat through the real per-instance provider path' do
+      message = Legion::Extensions::Llm::Message.new(role: :user, content: 'hello')
+      result = callable.chat(messages: [message], model: 'mlx-community/Llama-3.2-3B-Instruct-4bit',
+                             max_tokens: 100)
+      expect(result).to be_a(Legion::Extensions::Llm::Message)
+      expect(result.content).to eq('ssot stub response')
+      expect(callable.call_count).to eq(1)
+    end
+
+    it 'counts each dispatch op as an inference call' do
+      message = Legion::Extensions::Llm::Message.new(role: :user, content: 'hello')
+      callable.chat(messages: [message], model: 'm/v1')
+      callable.count_tokens(messages: [message], model: 'm/v1')
+      expect(callable.call_count).to eq(2)
     end
   end
 
