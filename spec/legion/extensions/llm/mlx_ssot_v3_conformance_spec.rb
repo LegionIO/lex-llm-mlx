@@ -49,7 +49,11 @@ STUB_COMPLETION_BODY = {
 # copies of the builders (D16).
 class MlxSsotHarness
   ACTOR = Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh
-  HARNESS_INSTANCE_ID = 'mac-studio-1.local:8000'
+
+  # The operator's config names — the identity (InstanceKey.instance_id)
+  # the discovery actor claims in tick_refresh (configured_instances
+  # names, byte-for-byte the frozen config's keys).
+  INSTANCE_NAMES = %w[mac-studio-1 mac-studio-2].freeze
 
   INSTANCE_CONFIGS = [
     {
@@ -64,11 +68,30 @@ class MlxSsotHarness
 
   def provider_family = :mlx
   def instance_configs = INSTANCE_CONFIGS
+  def instance_names = INSTANCE_NAMES
 
-  # Identity delegates to the production actor's derive_instance_id —
-  # the harness must not drift from the ID the actor actually claims.
+  # Identity is the operator's CONFIG NAME (index-aligned with
+  # INSTANCE_CONFIGS) — the harness must not drift from the identity the
+  # actor actually claims.
   def instance_id(instance_config:)
-    ACTOR.new.send(:derive_instance_id, instance_cfg: instance_config)
+    INSTANCE_NAMES[INSTANCE_CONFIGS.index(instance_config)]
+  end
+
+  # The SECONDARY physical id (host:port[/ak]) delegates to the
+  # production actor's derive_physical_id — dedup/diagnostics only,
+  # never identity.
+  def physical_id(instance_config:)
+    ACTOR.new.send(:derive_physical_id, instance_cfg: instance_config)
+  end
+
+  # The full production key shape: config-name identity + secondary
+  # physical id.
+  def build_key(config)
+    Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
+      provider_family: :mlx,
+      instance_id: instance_id(instance_config: config),
+      physical_id: physical_id(instance_config: config)
+    )
   end
 
   def build_callable(instance_config:)
@@ -146,14 +169,13 @@ class MlxSsotHarness
   end
 
   def production_draft(model_id:, tier:)
+    config = INSTANCE_CONFIGS.first
     ACTOR.new.send(
       :build_offering_draft,
       model_id: model_id,
       model_data: { id: model_id, max_model_len: 32_768 },
-      instance_cfg: { mlx_api_base: "http://#{HARNESS_INSTANCE_ID}", tier: tier },
-      instance_key: Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-        provider_family: :mlx, instance_id: HARNESS_INSTANCE_ID
-      )
+      instance_cfg: { mlx_api_base: config[:mlx_api_base], tier: tier },
+      instance_key: build_key(config)
     )
   end
 end
@@ -176,37 +198,56 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
   it_behaves_like 'an SSOT v3 provider adapter'
 
-  # --- MLX-specific identity derivation ----------------------------------------
+  # --- MLX-specific identity: config name + secondary physical id -------------
 
   describe 'instance identity derivation' do
-    it 'derives instance_id as host:port without API key' do
-      config = { mlx_api_base: 'http://mac-studio-1.local:8000' }
-      expect(ssot_harness.instance_id(instance_config: config)).to eq('mac-studio-1.local:8000')
+    it 'uses the operator config name as the instance identity' do
+      ssot_harness.instance_configs.each_with_index do |config, index|
+        expect(ssot_harness.instance_id(instance_config: config)).to eq(ssot_harness.instance_names[index])
+      end
     end
 
-    it 'derives instance_id as host:port/ak:fingerprint with API key' do
+    it 'derives the secondary physical id as host:port without API key' do
+      config = { mlx_api_base: 'http://mac-studio-1.local:8000' }
+      expect(ssot_harness.physical_id(instance_config: config)).to eq('mac-studio-1.local:8000')
+    end
+
+    it 'derives the secondary physical id as host:port/ak:fingerprint with API key' do
       config = { mlx_api_base: 'http://mac-studio-2.local:8001', mlx_api_key: 'sk-mlx-test-key' }
       fingerprint = Digest::SHA256.hexdigest('sk-mlx-test-key')[0, 6]
-      expect(ssot_harness.instance_id(instance_config: config)).to eq("mac-studio-2.local:8001/ak:#{fingerprint}")
+      expect(ssot_harness.physical_id(instance_config: config)).to eq("mac-studio-2.local:8001/ak:#{fingerprint}")
     end
 
-    it 'produces distinct instance IDs for two different endpoints' do
+    it 'produces distinct identities for the two configured instances' do
       ids = ssot_harness.instance_configs.map { |cfg| ssot_harness.instance_id(instance_config: cfg) }
       expect(ids.uniq.size).to eq(2)
     end
 
-    it 'reproduces the same instance_id across multiple calls (stable identity)' do
+    it 'keeps two config names at the same endpoint as distinct instances (no endpoint collapse)' do
+      shared_endpoint = { mlx_api_base: 'http://mac-studio-1.local:8000' }
+      physical = ssot_harness.physical_id(instance_config: shared_endpoint)
+      key_a = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
+        provider_family: :mlx, instance_id: 'studio-a', physical_id: physical
+      )
+      key_b = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
+        provider_family: :mlx, instance_id: 'studio-b', physical_id: physical
+      )
+      expect(key_a).not_to eq(key_b)
+      expect(key_a.physical_id).to eq(key_b.physical_id)
+    end
+
+    it 'reproduces the same identity across multiple calls (stable identity)' do
       config = ssot_harness.instance_configs.first
       first_call = ssot_harness.instance_id(instance_config: config)
       second_call = ssot_harness.instance_id(instance_config: config)
       expect(first_call).to eq(second_call)
     end
 
-    it 'derives identical identity with and without the /v1 suffix' do
+    it 'derives the same secondary physical id with and without the /v1 suffix' do
       config_with_v1 = { mlx_api_base: 'http://mac-studio-1.local:8000/v1' }
       config_without = { mlx_api_base: 'http://mac-studio-1.local:8000' }
-      expect(ssot_harness.instance_id(instance_config: config_with_v1))
-        .to eq(ssot_harness.instance_id(instance_config: config_without))
+      expect(ssot_harness.physical_id(instance_config: config_with_v1))
+        .to eq(ssot_harness.physical_id(instance_config: config_without))
     end
   end
 
@@ -215,20 +256,23 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   describe 'two MLX servers serving the same model' do
     def bring_up_instance(config, tier: :local)
       publisher = Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
-      instance_id = ssot_harness.instance_id(instance_config: config)
-      key = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-        provider_family: :mlx, instance_id: instance_id
-      )
+      key = ssot_harness.build_key(config)
+      instance_id = key.instance_id
+      physical_id = key.physical_id
       callable = ssot_harness.build_callable(instance_config: config)
       coordinator = Legion::Extensions::Llm::Inventory::ProbeCoordinator.new(
         instance_key: key, enqueue: ->(**) { true }
       )
 
-      token = publisher.claim_instance(instance_id: instance_id, callable: callable, probe_request_handle: coordinator)
-      probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
+      token = publisher.claim_instance(
+        instance_id: instance_id, physical_id: physical_id, callable: callable, probe_request_handle: coordinator
+      )
+      probe = publisher.readiness_probe_started(instance_id: instance_id, physical_id: physical_id,
+                                                publisher_token: token)
       drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: callable, tier: tier)
       publisher.activate_instance_snapshot(
-        instance_id: instance_id, publisher_token: token, offerings: drafts, sequence: 0, probe_token: probe
+        instance_id: instance_id, physical_id: physical_id, publisher_token: token,
+        offerings: drafts, sequence: 0, probe_token: probe
       )
 
       { publisher: publisher, key: key, callable: callable, token: token, drafts: drafts, coordinator: coordinator }
@@ -273,20 +317,23 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   describe 'tier change and identity preservation' do
     def bring_up_with_tier(config, tier:)
       publisher = Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
-      instance_id = ssot_harness.instance_id(instance_config: config)
-      key = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-        provider_family: :mlx, instance_id: instance_id
-      )
+      key = ssot_harness.build_key(config)
+      instance_id = key.instance_id
+      physical_id = key.physical_id
       callable = ssot_harness.build_callable(instance_config: config)
       coordinator = Legion::Extensions::Llm::Inventory::ProbeCoordinator.new(
         instance_key: key, enqueue: ->(**) { true }
       )
 
-      token = publisher.claim_instance(instance_id: instance_id, callable: callable, probe_request_handle: coordinator)
-      probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
+      token = publisher.claim_instance(
+        instance_id: instance_id, physical_id: physical_id, callable: callable, probe_request_handle: coordinator
+      )
+      probe = publisher.readiness_probe_started(instance_id: instance_id, physical_id: physical_id,
+                                                publisher_token: token)
       drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: callable, tier: tier)
       publisher.activate_instance_snapshot(
-        instance_id: instance_id, publisher_token: token, offerings: drafts, sequence: 0, probe_token: probe
+        instance_id: instance_id, physical_id: physical_id, publisher_token: token,
+        offerings: drafts, sequence: 0, probe_token: probe
       )
 
       { publisher: publisher, key: key, callable: callable, token: token, drafts: drafts }
@@ -296,7 +343,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       frontier_drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: context[:callable],
                                                            tier: tier)
       context[:publisher].replace_instance_snapshot(
-        instance_id: ssot_harness.instance_id(instance_config: config),
+        instance_id: context[:key].instance_id, physical_id: context[:key].physical_id,
         publisher_token: context[:token], offerings: frontier_drafts, sequence: 1
       )
     end
@@ -358,6 +405,22 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       chat_model = 'mlx-community/Llama-3.2-3B-Instruct-4bit'
       expect(chat_model).not_to match(pattern)
     end
+
+    # Authoritative operation evidence: a plain chat request must not
+    # misroute to an embedding instance (chat is unsupported there).
+    it 'publishes chat/stream_chat as unsupported and embed as supported for an embedding model' do
+      embed_model = 'nomic-ai/nomic-embed-text-v1.5'
+      draft = Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh.new.send(
+        :build_offering_draft,
+        model_id: embed_model,
+        model_data: { id: embed_model, max_model_len: 512 },
+        instance_cfg: config,
+        instance_key: ssot_harness.build_key(config)
+      )
+      expect(draft.operation_evidence[:chat].status).to eq(:unsupported)
+      expect(draft.operation_evidence[:stream_chat].status).to eq(:unsupported)
+      expect(draft.operation_evidence[:embed].status).to eq(:supported)
+    end
   end
 
   # --- Explicit operation evidence controls ------------------------------------
@@ -409,16 +472,14 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   describe 'startup gating' do
     let(:startup) do
       cfg = ssot_harness.instance_configs[0]
-      iid = ssot_harness.instance_id(instance_config: cfg)
-      key = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-        provider_family: :mlx, instance_id: iid
-      )
+      key = ssot_harness.build_key(cfg)
       callable = ssot_harness.build_callable(instance_config: cfg)
       coordinator = Legion::Extensions::Llm::Inventory::ProbeCoordinator.new(
         instance_key: key, enqueue: ->(**) { true }
       )
       publisher = Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
-      { cfg: cfg, instance_id: iid, key: key, callable: callable, coordinator: coordinator, publisher: publisher }
+      { cfg: cfg, instance_id: key.instance_id, physical_id: key.physical_id, key: key,
+        callable: callable, coordinator: coordinator, publisher: publisher }
     end
 
     it 'remains initializing until readiness probe succeeds' do
@@ -429,26 +490,27 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     def claim_startup
       s = startup
-      s[:publisher].claim_instance(instance_id: s[:instance_id], callable: s[:callable],
-                                   probe_request_handle: s[:coordinator])
+      s[:publisher].claim_instance(instance_id: s[:instance_id], physical_id: s[:physical_id],
+                                   callable: s[:callable], probe_request_handle: s[:coordinator])
     end
 
     context 'when initial readiness fails' do
       let(:token) do
         startup[:publisher].claim_instance(
-          instance_id: startup[:instance_id], callable: startup[:callable],
-          probe_request_handle: startup[:coordinator]
+          instance_id: startup[:instance_id], physical_id: startup[:physical_id],
+          callable: startup[:callable], probe_request_handle: startup[:coordinator]
         )
       end
       let(:probe) do
         startup[:publisher].readiness_probe_started(
-          instance_id: startup[:instance_id], publisher_token: token
+          instance_id: startup[:instance_id], physical_id: startup[:physical_id], publisher_token: token
         )
       end
 
       before do
         startup[:publisher].readiness_failed(
-          instance_id: startup[:instance_id], probe_token: probe, reason: 'MLX /health failed'
+          instance_id: startup[:instance_id], physical_id: startup[:physical_id],
+          probe_token: probe, reason: 'MLX /health failed'
         )
       end
 
@@ -461,18 +523,18 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     context 'when readiness succeeds with offerings' do
       before do
         token = startup[:publisher].claim_instance(
-          instance_id: startup[:instance_id], callable: startup[:callable],
-          probe_request_handle: startup[:coordinator]
+          instance_id: startup[:instance_id], physical_id: startup[:physical_id],
+          callable: startup[:callable], probe_request_handle: startup[:coordinator]
         )
         probe = startup[:publisher].readiness_probe_started(
-          instance_id: startup[:instance_id], publisher_token: token
+          instance_id: startup[:instance_id], physical_id: startup[:physical_id], publisher_token: token
         )
         drafts = ssot_harness.build_offering_drafts(
           instance_config: startup[:cfg], callable: startup[:callable], tier: :local
         )
         startup[:publisher].activate_instance_snapshot(
-          instance_id: startup[:instance_id], publisher_token: token,
-          offerings: drafts, sequence: 0, probe_token: probe
+          instance_id: startup[:instance_id], physical_id: startup[:physical_id],
+          publisher_token: token, offerings: drafts, sequence: 0, probe_token: probe
         )
       end
 
@@ -491,25 +553,26 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   describe 'readiness probe lifecycle' do
     let(:probe_ctx) do
       cfg = ssot_harness.instance_configs[0]
-      iid = ssot_harness.instance_id(instance_config: cfg)
-      key = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-        provider_family: :mlx, instance_id: iid
-      )
+      key = ssot_harness.build_key(cfg)
       callable = ssot_harness.build_callable(instance_config: cfg)
       coordinator = Legion::Extensions::Llm::Inventory::ProbeCoordinator.new(
         instance_key: key, enqueue: ->(**) { true }
       )
       publisher = Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
-      { cfg: cfg, instance_id: iid, key: key, callable: callable, coordinator: coordinator, publisher: publisher }
+      { cfg: cfg, instance_id: key.instance_id, physical_id: key.physical_id, key: key,
+        callable: callable, coordinator: coordinator, publisher: publisher }
     end
 
     def activate_instance
-      pub, iid, callable, coord, cfg = probe_ctx.values_at(:publisher, :instance_id, :callable, :coordinator, :cfg)
-      token = pub.claim_instance(instance_id: iid, callable: callable, probe_request_handle: coord)
-      probe = pub.readiness_probe_started(instance_id: iid, publisher_token: token)
+      pub, iid, physical_id, callable, coord, cfg =
+        probe_ctx.values_at(:publisher, :instance_id, :physical_id, :callable, :coordinator, :cfg)
+      token = pub.claim_instance(instance_id: iid, physical_id: physical_id, callable: callable,
+                                 probe_request_handle: coord)
+      probe = pub.readiness_probe_started(instance_id: iid, physical_id: physical_id, publisher_token: token)
       drafts = ssot_harness.build_offering_drafts(instance_config: cfg, callable: callable, tier: :local)
       pub.activate_instance_snapshot(
-        instance_id: iid, publisher_token: token, offerings: drafts, sequence: 0, probe_token: probe
+        instance_id: iid, physical_id: physical_id, publisher_token: token,
+        offerings: drafts, sequence: 0, probe_token: probe
       )
       token
     end
@@ -517,17 +580,18 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     def setup_stale_probe_scenario
       pub = probe_ctx[:publisher]
       iid = probe_ctx[:instance_id]
+      physical_id = probe_ctx[:physical_id]
       token = activate_instance
-      stale_probe = pub.readiness_probe_started(instance_id: iid, publisher_token: token)
-      fresh_probe = pub.readiness_probe_started(instance_id: iid, publisher_token: token)
-      pub.readiness_failed(instance_id: iid, probe_token: fresh_probe, reason: 'server down')
+      stale_probe = pub.readiness_probe_started(instance_id: iid, physical_id: physical_id, publisher_token: token)
+      fresh_probe = pub.readiness_probe_started(instance_id: iid, physical_id: physical_id, publisher_token: token)
+      pub.readiness_failed(instance_id: iid, physical_id: physical_id, probe_token: fresh_probe, reason: 'server down')
       [token, stale_probe]
     end
 
     it 'rejects a stale probe started before a newer failure' do
       _token, stale_probe = setup_stale_probe_scenario
       result = probe_ctx[:publisher].readiness_succeeded(
-        instance_id: probe_ctx[:instance_id], probe_token: stale_probe
+        instance_id: probe_ctx[:instance_id], physical_id: probe_ctx[:physical_id], probe_token: stale_probe
       )
       expect(result.applied).to be(false)
     end
@@ -535,7 +599,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     it 'reports stale reason on rejected probe' do
       _token, stale_probe = setup_stale_probe_scenario
       result = probe_ctx[:publisher].readiness_succeeded(
-        instance_id: probe_ctx[:instance_id], probe_token: stale_probe
+        instance_id: probe_ctx[:instance_id], physical_id: probe_ctx[:physical_id], probe_token: stale_probe
       )
       expect(result.reason).to eq(:stale_probe)
     end
@@ -543,12 +607,13 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     def mark_unavailable_and_recover(token)
       pub = probe_ctx[:publisher]
       iid = probe_ctx[:instance_id]
+      physical_id = probe_ctx[:physical_id]
       key = probe_ctx[:key]
       registry.dispatch_instance_unavailable(
         instance_key: key, publisher_token_id: token.publisher_token_id, reason: 'connection refused'
       )
-      new_probe = pub.readiness_probe_started(instance_id: iid, publisher_token: token)
-      pub.readiness_succeeded(instance_id: iid, probe_token: new_probe)
+      new_probe = pub.readiness_probe_started(instance_id: iid, physical_id: physical_id, publisher_token: token)
+      pub.readiness_succeeded(instance_id: iid, physical_id: physical_id, probe_token: new_probe)
     end
 
     it 'recovers an unavailable instance after a valid probe succeeds' do
@@ -563,20 +628,23 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   describe 'instance-unavailable isolation' do
     def bring_up(config)
       publisher = Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
-      instance_id = ssot_harness.instance_id(instance_config: config)
-      key = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-        provider_family: :mlx, instance_id: instance_id
-      )
+      key = ssot_harness.build_key(config)
+      instance_id = key.instance_id
+      physical_id = key.physical_id
       callable = ssot_harness.build_callable(instance_config: config)
       coordinator = Legion::Extensions::Llm::Inventory::ProbeCoordinator.new(
         instance_key: key, enqueue: ->(**) { true }
       )
 
-      token = publisher.claim_instance(instance_id: instance_id, callable: callable, probe_request_handle: coordinator)
-      probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
+      token = publisher.claim_instance(
+        instance_id: instance_id, physical_id: physical_id, callable: callable, probe_request_handle: coordinator
+      )
+      probe = publisher.readiness_probe_started(instance_id: instance_id, physical_id: physical_id,
+                                                publisher_token: token)
       drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: callable, tier: :local)
       publisher.activate_instance_snapshot(
-        instance_id: instance_id, publisher_token: token, offerings: drafts, sequence: 0, probe_token: probe
+        instance_id: instance_id, physical_id: physical_id, publisher_token: token,
+        offerings: drafts, sequence: 0, probe_token: probe
       )
 
       { publisher: publisher, key: key, callable: callable, token: token }
@@ -621,10 +689,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   describe 'ProbeCoordinator coalescing' do
     let(:enqueue_calls) { [] }
     let(:probe_setup) do
-      iid = ssot_harness.instance_id(instance_config: ssot_harness.instance_configs[0])
-      key = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-        provider_family: :mlx, instance_id: iid
-      )
+      key = ssot_harness.build_key(ssot_harness.instance_configs[0])
       coordinator = Legion::Extensions::Llm::Inventory::ProbeCoordinator.new(
         instance_key: key,
         enqueue: lambda { |request:|
@@ -632,7 +697,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
           true
         }
       )
-      { instance_id: iid, key: key, coordinator: coordinator }
+      { instance_id: key.instance_id, key: key, coordinator: coordinator }
     end
 
     def enqueue_and_begin_probe(revision:)
@@ -755,12 +820,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
   describe 'exact fleet worker execution contract' do
     let(:config) { ssot_harness.instance_configs[0] }
-    let(:instance_id) { ssot_harness.instance_id(instance_config: config) }
-    let(:key) do
-      Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-        provider_family: :mlx, instance_id: instance_id
-      )
-    end
+    let(:key) { ssot_harness.build_key(config) }
 
     def activate_offering
       publisher = Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
@@ -771,14 +831,21 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     end
 
     def claim_and_activate(publisher:, callable:)
+      instance_id = key.instance_id
+      physical_id = key.physical_id
       coordinator = Legion::Extensions::Llm::Inventory::ProbeCoordinator.new(
         instance_key: key, enqueue: ->(**) { true }
       )
-      token = publisher.claim_instance(instance_id: instance_id, callable: callable, probe_request_handle: coordinator)
-      probe = publisher.readiness_probe_started(instance_id: instance_id, publisher_token: token)
+      token = publisher.claim_instance(
+        instance_id: instance_id, physical_id: physical_id,
+        callable: callable, probe_request_handle: coordinator
+      )
+      probe = publisher.readiness_probe_started(instance_id: instance_id, physical_id: physical_id,
+                                                publisher_token: token)
       drafts = ssot_harness.build_offering_drafts(instance_config: config, callable: callable, tier: :local)
       publisher.activate_instance_snapshot(
-        instance_id: instance_id, publisher_token: token, offerings: drafts, sequence: 0, probe_token: probe
+        instance_id: instance_id, physical_id: physical_id, publisher_token: token,
+        offerings: drafts, sequence: 0, probe_token: probe
       )
       token
     end
@@ -786,7 +853,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     def build_envelope(offering_id:, model:, operation: 'chat', params: { messages: [] })
       {
         execution_contract: Legion::Extensions::Llm::Fleet::Protocol::EXACT_EXECUTION_CONTRACT,
-        offering_id: offering_id, provider: 'mlx', provider_instance: instance_id,
+        offering_id: offering_id, provider: 'mlx', provider_instance: key.instance_id,
         model: model, operation: operation, params: params
       }
     end
@@ -896,14 +963,15 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     # Delegates to the production draft path (actor's build_offering_draft);
     # an empty model must be rejected by the OfferingDraft validation there.
     def build_empty_model_offering
-      MlxSsotHarness::ACTOR.new.send(
+      harness = MlxSsotHarness.new
+      config = harness.instance_configs.first
+      harness_class = MlxSsotHarness::ACTOR
+      harness_class.new.send(
         :build_offering_draft,
         model_id: '',
         model_data: { id: '' },
-        instance_cfg: { mlx_api_base: "http://#{MlxSsotHarness::HARNESS_INSTANCE_ID}", tier: :local },
-        instance_key: Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-          provider_family: :mlx, instance_id: MlxSsotHarness::HARNESS_INSTANCE_ID
-        )
+        instance_cfg: { mlx_api_base: config[:mlx_api_base], tier: :local },
+        instance_key: harness.build_key(config)
       )
     end
   end

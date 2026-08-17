@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.5.1] - 2026-08-17
+
+### Changed
+- **SSOT v3 fail-forward identity** — Instance identity is now the operator's config name
+  (`InstanceKey.instance_id` = the frozen config key the router uses for `instances.<name>`
+  lookups). The normalized endpoint `host:port` (plus optional API key SHA256 fingerprint) is
+  carried as the secondary `physical_id` for dedup and diagnostics only, never identity.
+  Two config names at the same endpoint remain distinct instances (no endpoint collapse).
+  All `Inventory::Publisher` calls now pass `physical_id:`.
+- Bump floor to `lex-llm >= 0.7.1` (carries the SSOT v3 `InstanceKey` `physical_id` and the
+  Publisher `physical_id:` kwargs; 0.7.0 publishers reject the `physical_id:` kwarg).
+
+### Added
+- Conformance coverage for config-name identity, secondary physical id, and no endpoint
+  collapse, plus an authoritative operation-evidence check pinning that embedding models
+  publish `chat`/`stream_chat` as `:unsupported` and `embed` as `:supported` so a plain chat
+  request cannot misroute to an embedding-only instance.
+
 ## [0.5.0] - 2026-08-13
 
 ### Changed

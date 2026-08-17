@@ -249,11 +249,15 @@ module Legion
               return unless coordinator.begin_probe
 
               probe_token = publisher.readiness_probe_started(
-                instance_id: instance_id, publisher_token: state[:publisher_token]
+                instance_id: instance_id, physical_id: state[:physical_id],
+                publisher_token: state[:publisher_token]
               )
               readiness = check_health(instance_cfg: state[:instance_cfg])
               coordinator.finish_probe
-              report_probe_result(instance_id: instance_id, probe_token: probe_token, readiness: readiness)
+              report_probe_result(
+                instance_id: instance_id, physical_id: state[:physical_id],
+                probe_token: probe_token, readiness: readiness
+              )
             rescue StandardError => e
               begin
                 coordinator&.finish_probe
@@ -271,11 +275,15 @@ module Legion
               return unless coordinator.begin_probe(request: request)
 
               probe_token = publisher.readiness_probe_started(
-                instance_id: instance_id, publisher_token: state[:publisher_token]
+                instance_id: instance_id, physical_id: state[:physical_id],
+                publisher_token: state[:publisher_token]
               )
               readiness = check_health(instance_cfg: state[:instance_cfg])
               coordinator.finish_probe(request: request)
-              report_probe_result(instance_id: instance_id, probe_token: probe_token, readiness: readiness)
+              report_probe_result(
+                instance_id: instance_id, physical_id: state[:physical_id],
+                probe_token: probe_token, readiness: readiness
+              )
             rescue StandardError => e
               begin
                 coordinator&.finish_probe(request: request)
@@ -285,12 +293,14 @@ module Legion
               handle_exception(e, level: :warn, operation: 'mlx.actor.reactive_probe', instance_id: instance_id)
             end
 
-            def report_probe_result(instance_id:, probe_token:, readiness:)
+            def report_probe_result(instance_id:, physical_id:, probe_token:, readiness:)
               if readiness.ready?
-                publisher.readiness_succeeded(instance_id: instance_id, probe_token: probe_token)
+                publisher.readiness_succeeded(
+                  instance_id: instance_id, physical_id: physical_id, probe_token: probe_token
+                )
               else
                 publisher.readiness_failed(
-                  instance_id: instance_id, probe_token: probe_token, reason: readiness.reason
+                  instance_id: instance_id, physical_id: physical_id, probe_token: probe_token, reason: readiness.reason
                 )
               end
             end
@@ -319,7 +329,11 @@ module Legion
               @instance_states ||= {}
               configured_ids = {}
               configured_instances.each do |name, instance_cfg|
-                instance_id = derive_instance_id(instance_cfg: instance_cfg)
+                # Identity is the operator's CONFIG NAME — the key the
+                # frozen config uses and the router keys instances.<name>
+                # settings lookups by. Two names at the same endpoint stay
+                # distinct instances (the physical id is secondary).
+                instance_id = name.to_s
                 configured_ids[instance_id] = true
                 state = @instance_states[instance_id]
                 if state.nil?
@@ -346,7 +360,10 @@ module Legion
             end
 
             def remove_instance_state(instance_id:, state:)
-              publisher.remove_instance(instance_id: instance_id, publisher_token: state[:publisher_token])
+              publisher.remove_instance(
+                instance_id: instance_id, physical_id: state[:physical_id],
+                publisher_token: state[:publisher_token]
+              )
               clear_instance_health(config_name: state[:name])
               @instance_states.delete(instance_id)
             end
@@ -371,7 +388,8 @@ module Legion
 
               state[:sequence] += 1
               publisher.replace_instance_snapshot(
-                instance_id: instance_id, publisher_token: state[:publisher_token],
+                instance_id: instance_id, physical_id: state[:physical_id],
+                publisher_token: state[:publisher_token],
                 offerings: new_offerings, sequence: state[:sequence]
               )
               state[:offerings] = new_offerings
@@ -404,13 +422,15 @@ module Legion
             def commit_readiness(instance_id:, offerings:, probe_token:, readiness:, state:)
               if readiness.ready?
                 publisher.activate_instance_snapshot(
-                  instance_id: instance_id, publisher_token: state[:publisher_token],
+                  instance_id: instance_id, physical_id: state[:physical_id],
+                  publisher_token: state[:publisher_token],
                   offerings: offerings, sequence: state[:sequence], probe_token: probe_token
                 )
                 state[:offerings] = offerings
               else
                 publisher.readiness_failed(
-                  instance_id: instance_id, probe_token: probe_token, reason: readiness.reason
+                  instance_id: instance_id, physical_id: state[:physical_id],
+                  probe_token: probe_token, reason: readiness.reason
                 )
               end
             end
@@ -428,7 +448,11 @@ module Legion
               Legion::Extensions::Llm::Mlx.configured_instances
             end
 
-            def derive_instance_id(instance_cfg:)
+            # The SECONDARY physical id (host:port, or host:port/ak:<fp>
+            # when the instance is keyed). It is carried by InstanceKey
+            # for dedup and diagnostics only — never identity. Identity
+            # is the operator's config name (see tick_refresh).
+            def derive_physical_id(instance_cfg:)
               base_url = instance_cfg[:mlx_api_base] || instance_cfg[:endpoint] || 'http://localhost:8000'
               host_port = extract_host_port(url: base_url)
               api_key = instance_cfg[:mlx_api_key] || instance_cfg.dig(:credentials, :api_key)
@@ -451,9 +475,9 @@ module Legion
               raise
             end
 
-            def build_instance_key(instance_id:)
+            def build_instance_key(instance_id:, physical_id:)
               Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
-                provider_family: :mlx, instance_id: instance_id
+                provider_family: :mlx, instance_id: instance_id, physical_id: physical_id
               )
             end
 
@@ -645,16 +669,19 @@ module Legion
             end
 
             def claim_and_activate_instance(name:, instance_cfg:)
-              instance_id = derive_instance_id(instance_cfg: instance_cfg)
-              instance_key = build_instance_key(instance_id: instance_id)
+              instance_id = name.to_s
+              physical_id = derive_physical_id(instance_cfg: instance_cfg)
+              instance_key = build_instance_key(instance_id: instance_id, physical_id: physical_id)
               callable = Legion::Extensions::Llm::Mlx::Actor::MlxCallable.new(instance_cfg: instance_cfg, logger: log)
               probe_coordinator = build_probe_coordinator(instance_id: instance_id, instance_key: instance_key)
               publisher_token = publisher.claim_instance(
-                instance_id: instance_id, callable: callable, probe_request_handle: probe_coordinator
+                instance_id: instance_id, physical_id: physical_id, callable: callable,
+                probe_request_handle: probe_coordinator
               )
               run_activation(
                 instance_id: instance_id, publisher_token: publisher_token,
-                instance_desc: { name: name, instance_key: instance_key, instance_cfg: instance_cfg,
+                instance_desc: { name: name, instance_id: instance_id, physical_id: physical_id,
+                                 instance_key: instance_key, instance_cfg: instance_cfg,
                                  callable: callable, probe_coordinator: probe_coordinator }
               )
             end
@@ -680,7 +707,8 @@ module Legion
 
               @instance_states.each do |instance_id, state|
                 publisher.remove_instance(
-                  instance_id: instance_id, publisher_token: state[:publisher_token]
+                  instance_id: instance_id, physical_id: state[:physical_id],
+                  publisher_token: state[:publisher_token]
                 )
                 clear_instance_health(config_name: state[:name])
               rescue StandardError => e

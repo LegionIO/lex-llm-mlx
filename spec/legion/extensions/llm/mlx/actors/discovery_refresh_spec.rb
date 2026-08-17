@@ -19,16 +19,22 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
 
   # Plain methods (not lets) to stay under RSpec/MultipleMemoizedHelpers.
 
+  # Physical endpoints (host:port) — the SECONDARY physical id. Identity
+  # is the operator's config name (:studio / :other below).
   def studio_id = '127.0.0.1:1'
 
   def other_id = '127.0.0.1:2'
 
   def studio_key
-    Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(provider_family: :mlx, instance_id: studio_id)
+    Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
+      provider_family: :mlx, instance_id: 'studio', physical_id: studio_id
+    )
   end
 
   def other_key
-    Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(provider_family: :mlx, instance_id: other_id)
+    Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
+      provider_family: :mlx, instance_id: 'other', physical_id: other_id
+    )
   end
 
   def readiness(ready:, reason:)
