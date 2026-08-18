@@ -63,14 +63,64 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
   describe '.discover_instances' do
     let(:settings_tree) { Legion::Settings.loader.settings[:extensions][:llm][:mlx] }
+    let(:synthetic_default) { described_class.default_settings.dig(:instances, :default) }
 
     after { settings_tree.replace({}) }
 
     it 'never fabricates instances by port-scanning' do
-      # With no instances configured, only the registered top-level
-      # endpoint default surfaces — never a socket-probe result.
+      # With no instances configured, nothing surfaces — no synthesized
+      # :local fallback, no socket-probe result, no phantom builder.
       settings_tree.replace({})
-      expect(described_class.discover_instances.keys).to eq([:local])
+      expect(described_class.discover_instances).to eq({})
+    end
+
+    # D3: the synthetic instances.default section (the extension's own
+    # instance defaults, nested by provider_settings at boot) is an
+    # unconfigured phantom while it is unmodified — it must never reach
+    # the claim path. The actor's claimable set (tick_refresh iterates
+    # configured_instances into claim_and_activate_instance) excludes it.
+    it 'skips the synthetic default while it is the unmodified template (claimable set)' do
+      settings_tree.replace(instances: { default: synthetic_default })
+
+      expect(described_class.configured_instances).to eq({})
+    end
+
+    it 'excludes the synthetic default from the fleet-responder discovery set' do
+      settings_tree.replace(instances: { default: synthetic_default })
+
+      # discover_instances is the exact input to FleetWorker#enabled?'s
+      # ProviderResponder.enabled_for? — the phantom localhost instance
+      # must not be in it.
+      expect(described_class.discover_instances).to eq({})
+      expect(Legion::Extensions::Llm::Fleet::ProviderResponder.enabled_for?(described_class.discover_instances))
+        .to be(false)
+    end
+
+    # A configured (non-template) instances.default — a real operator
+    # entry with real values — is NOT the synthetic phantom: v2 parity,
+    # 'default' accepted as a plain instance label. The provider layer
+    # passes it to the claim path; whether the foundation accepts the
+    # name is a lex-llm InstanceKey contract, not a provider-layer
+    # decision (asserted on the discover/claimable set, not an
+    # end-to-end claim).
+    it 'passes a configured (non-template) default to the claim path' do
+      settings_tree.replace(instances: { default: synthetic_default.merge(endpoint: 'http://10.0.0.5:8000') })
+
+      instances = described_class.configured_instances
+      expect(instances.keys).to eq([:default])
+      expect(instances[:default]).to include(mlx_api_base: 'http://10.0.0.5:8000', tier: :local)
+    end
+
+    it 'enables the fleet responder when a configured default opts in' do
+      settings_tree.replace(instances: {
+                              default: synthetic_default.merge(
+                                endpoint: 'http://10.0.0.5:8000',
+                                fleet: { respond_to_requests: true }
+                              )
+                            })
+
+      expect(Legion::Extensions::Llm::Fleet::ProviderResponder.enabled_for?(described_class.discover_instances))
+        .to be(true)
     end
 
     it 'discovers named instances from extension settings' do

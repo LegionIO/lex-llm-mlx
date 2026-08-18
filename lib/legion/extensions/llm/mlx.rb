@@ -41,29 +41,54 @@ module Legion
 
         # Single source of truth for MLX instance discovery. The SSOT
         # discovery actor and the fleet responder both read this: only
-        # operator-configured instances (plus the registered top-level
-        # endpoint default when no instances are configured at all).
-        # No port-scanning, no fabricated instances, no tier override.
+        # operator-configured instances. No port-scanning, no fabricated
+        # instances, no tier override.
         def self.discover_instances
           configured_instances
         end
 
+        # Only instances the operator actually configured are claimable.
+        # The synthetic instances.default section (provider_settings nests
+        # the extension's own instance defaults there at boot) is skipped
+        # with a warn while it is still the unmodified extension default —
+        # an unconfigured phantom must never be auto-registered, and a
+        # localhost endpoint is never a fallback identity.
         def self.configured_instances
           provider_cfg = Legion::Settings.dig(:extensions, :llm, :mlx) || {}
           instances = {}
           cfg_instances = provider_cfg[:instances]
           if cfg_instances.is_a?(Hash)
-            cfg_instances.each { |name, config| instances[name.to_sym] = normalize_instance_config(config) }
+            cfg_instances.each do |name, config|
+              normalized = normalize_instance_config(config)
+              if unconfigured_default?(name: name, normalized: normalized)
+                log.warn("[mlx][discovery] action=skip_instance instance=#{name} reason=synthetic_default")
+                next
+              end
+
+              instances[name.to_sym] = normalized
+            end
           end
-
-          return instances unless instances.empty?
-
-          instances[:local] = {
-            mlx_api_base: provider_cfg[:endpoint],
-            tier: :local,
-            mlx_api_key: provider_cfg.dig(:credentials, :api_key)
-          }
           instances
+        end
+
+        # The synthetic default is the extension's OWN registered instance
+        # defaults (endpoint http://localhost:8000 + fleet/limits blocks),
+        # deep-merged into instances.default by provider_settings. It is
+        # "configured" only when the operator changed something — a
+        # configured 'default' passes the provider layer and reaches the
+        # claim path (v2 parity: 'default' is a plain instance label). ONE
+        # predicate, TWO consumers: the actor's claim path (tick_refresh
+        # iterates configured_instances into claim_and_activate_instance)
+        # and the fleet responder (discover_instances → configured_instances)
+        # both reach it through this single filter point — no drift.
+        def self.unconfigured_default?(name:, normalized:)
+          name.to_sym == :default && normalized == normalized_synthetic_default_instance
+        end
+
+        def self.normalized_synthetic_default_instance
+          @normalized_synthetic_default_instance ||= normalize_instance_config(
+            default_settings.dig(:instances, :default) || {}
+          )
         end
 
         def self.normalize_instance_config(config)

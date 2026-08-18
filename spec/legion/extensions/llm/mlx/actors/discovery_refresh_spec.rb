@@ -170,6 +170,61 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
     end
   end
 
+  # D3: only operator-configured instances are registered — the synthetic
+  # instances.default template is an unconfigured phantom while unmodified
+  # (the provider-layer skip keeps it out of the claim path before
+  # InstanceKey ever sees the reserved name).
+  describe 'unconfigured phantom handling (D3)' do
+    let(:synthetic_default) { Legion::Extensions::Llm::Mlx.default_settings.dig(:instances, :default) }
+
+    def instance_ids
+      registry.snapshot.each_instance.map { |record| record.instance_key.instance_id }
+    end
+
+    it 'registers nothing when only the synthetic default is present' do
+      settings_tree[:instances] = { default: synthetic_default }
+
+      actor.manual
+
+      expect(instance_ids).to be_empty
+      # The derived host:port is the SECONDARY physical id, never the
+      # identity — nothing is published under it either.
+      expect(registry.snapshot.publication_status(
+               instance_key: Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
+                 provider_family: :mlx, instance_id: 'localhost:8000', physical_id: 'localhost:8000'
+               )
+             )).to be_nil
+    end
+
+    it 'claims a named instance alongside the synthetic default, never the phantom' do
+      settings_tree[:instances] = { default: synthetic_default, studio: { endpoint: "http://#{studio_id}" } }
+      make_healthy!
+
+      actor.manual
+
+      expect(instance_ids).to eq(['studio'])
+    end
+
+    it 'keeps the discovery pass alive when the foundation rejects the configured default claim' do
+      # The provider layer passes a configured (non-template)
+      # instances.default to the claim path (v2 parity). Whether the
+      # foundation accepts the name is a lex-llm InstanceKey contract,
+      # not a provider-layer decision: under the current lex-llm floor
+      # the claim raises, the actor logs it, and the rest of the pass
+      # still runs — a claim failure for one instance must not poison
+      # the others.
+      settings_tree[:instances] = {
+        default: synthetic_default.merge(endpoint: 'http://127.0.0.1:11500'),
+        studio: { endpoint: "http://#{studio_id}" }
+      }
+      make_healthy!
+
+      actor.manual
+
+      expect(instance_ids).to include('studio')
+    end
+  end
+
   describe '#time' do
     it 'honors the registered discovery.interval_seconds' do
       settings_tree[:discovery] = { enabled: true, interval_seconds: 42 }
