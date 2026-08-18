@@ -196,13 +196,13 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
              )).to be_nil
     end
 
-    it 'claims a named instance alongside the synthetic default, never the phantom' do
+    it 'claims a named instance alongside the default instance' do
       settings_tree[:instances] = { default: synthetic_default, studio: { endpoint: "http://#{studio_id}" } }
       make_healthy!
 
       actor.manual
 
-      expect(instance_ids).to eq(['studio'])
+      expect(instance_ids).to contain_exactly('default', 'studio')
     end
 
     it 'keeps the discovery pass alive when the foundation rejects the configured default claim' do
