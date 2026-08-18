@@ -1,23 +1,27 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'legion/extensions/llm/fleet/provider_responder'
 
 RSpec.describe Legion::Extensions::Llm::Mlx do
   let(:provider) { described_class::Provider.new(Legion::Extensions::Llm.config) }
   let(:model) { Legion::Extensions::Llm::Model::Info.new(id: 'mlx-community/Qwen3-14B-4bit', provider: :mlx) }
-  let(:registry_publisher) { instance_double(Legion::Extensions::Llm::RegistryPublisher) }
 
-  it 'exposes provider defaults through the shared provider settings shape' do # rubocop:disable RSpec/ExampleLength
+  it 'exposes provider defaults through the shared provider settings shape' do
     settings = described_class.default_settings
-    instance = settings.dig(:instances, :default)
-
     expect(settings[:enabled]).to be true
     expect(settings[:provider_family]).to eq(:mlx)
-    expect(instance).to include(
-      endpoint: 'http://localhost:8000',
-      credentials: hash_including(api_key: nil),
-      fleet: hash_including(respond_to_requests: false)
-    )
+  end
+
+  it 'includes endpoint default in provider settings' do
+    instance = described_class.default_settings.dig(:instances, :default)
+    expect(instance).to include(endpoint: 'http://localhost:8000')
+  end
+
+  it 'includes credentials and fleet defaults in provider settings' do
+    instance = described_class.default_settings.dig(:instances, :default)
+    expect(instance).to include(credentials: hash_including(api_key: nil),
+                                fleet: hash_including(respond_to_requests: false))
   end
 
   it 'does not register on the deprecated Provider.register registry' do
@@ -57,90 +61,81 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     expect(parsed_models.map { |model| model.modalities.to_h }).to eq(expected_modalities)
   end
 
-  it 'publishes live readiness metadata asynchronously through the base registry publisher' do
-    allow(described_class::Provider).to receive(:registry_publisher).and_return(registry_publisher)
-    allow(provider.connection).to receive(:get).with('/health').and_return(fake_response({}))
-    allow(registry_publisher).to receive(:publish_readiness_async)
-
-    readiness = provider.readiness(live: true)
-
-    expect(registry_publisher).to have_received(:publish_readiness_async).with(readiness)
-  end
-
-  it 'publishes discovered models asynchronously through the base registry publisher' do
-    stub_registry_publisher
-    stub_model_discovery
-
-    models = provider.list_models
-
-    expect(registry_publisher).to have_received(:publish_models_async)
-      .with(models, readiness: hash_including(provider: :mlx, live: false))
-  end
-
-  it 'builds sanitized lex-llm registry events for MLX model availability via base builder' do
-    builder = Legion::Extensions::Llm::RegistryEventBuilder.new(provider_family: :mlx)
-    event = builder.model_available(model, readiness: { ready: true })
-
-    expect(event.to_h).to include(event_type: :offering_available)
-    expect(event.to_h.dig(:offering, :provider_family)).to eq(:mlx)
-    expect(event.to_h.dig(:offering, :model)).to eq('mlx-community/Qwen3-14B-4bit')
-  end
-
-  it 'creates the registry publisher with the :mlx provider family' do
-    described_class::Provider.registry_publisher = nil
-    pub = described_class::Provider.registry_publisher
-
-    expect(pub).to be_a(Legion::Extensions::Llm::RegistryPublisher)
-    expect(pub.provider_family).to eq(:mlx)
-  end
-
   describe '.discover_instances' do
-    before do
-      allow(Legion::Extensions::Llm::CredentialSources).to receive_messages(socket_open?: false, setting: nil)
-    end
+    let(:settings_tree) { Legion::Settings.loader.settings[:extensions][:llm][:mlx] }
+    let(:synthetic_default) { described_class.default_settings.dig(:instances, :default) }
 
-    it 'returns an empty hash when no local server or settings are available' do
+    after { settings_tree.replace({}) }
+
+    it 'never fabricates instances by port-scanning' do
+      # With no instances configured, nothing surfaces — no synthesized
+      # :local fallback, no socket-probe result, no phantom builder.
+      settings_tree.replace({})
       expect(described_class.discover_instances).to eq({})
     end
 
-    it 'discovers a :local instance when port 8000 is reachable' do
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:socket_open?)
-        .with('localhost', 8000, timeout: 0.1).and_return(true)
+    it 'includes the default template in the claimable set' do
+      settings_tree.replace(instances: { default: synthetic_default })
 
-      instances = described_class.discover_instances
-
-      expect(instances[:local]).to eq(base_url: 'http://localhost:8000', tier: :local, capabilities: [:completion])
+      expect(described_class.configured_instances).to have_key(:default)
     end
 
-    it 'discovers named instances from extension settings' do # rubocop:disable RSpec/ExampleLength
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
-        .with(:extensions, :llm, :mlx, :instances)
-        .and_return({ gpu1: { base_url: 'http://gpu1:8080' } })
+    # A configured (non-template) instances.default — a real operator
+    # entry with real values — is NOT the synthetic phantom: v2 parity,
+    # 'default' accepted as a plain instance label. The provider layer
+    # passes it to the claim path; whether the foundation accepts the
+    # name is a lex-llm InstanceKey contract, not a provider-layer
+    # decision (asserted on the discover/claimable set, not an
+    # end-to-end claim).
+    it 'passes a configured (non-template) default to the claim path' do
+      settings_tree.replace(instances: { default: synthetic_default.merge(endpoint: 'http://10.0.0.5:8000') })
 
+      instances = described_class.configured_instances
+      expect(instances.keys).to eq([:default])
+      expect(instances[:default]).to include(mlx_api_base: 'http://10.0.0.5:8000', tier: :local)
+    end
+
+    it 'enables the fleet responder when a configured default opts in' do
+      settings_tree.replace(instances: {
+                              default: synthetic_default.merge(
+                                endpoint: 'http://10.0.0.5:8000',
+                                fleet: { respond_to_requests: true }
+                              )
+                            })
+
+      expect(Legion::Extensions::Llm::Fleet::ProviderResponder.enabled_for?(described_class.discover_instances))
+        .to be(true)
+    end
+
+    it 'discovers named instances from extension settings' do
+      settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080' } })
       instances = described_class.discover_instances
+      expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080', tier: :local)
+    end
 
-      expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080', tier: :direct)
+    it 'removes base_url key after normalization' do
+      settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080' } })
+      instances = described_class.discover_instances
       expect(instances[:gpu1]).not_to have_key(:base_url)
     end
 
-    it 'normalizes OpenAI-compatible /v1 settings roots' do # rubocop:disable RSpec/ExampleLength
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
-        .with(:extensions, :llm, :mlx, :instances)
-        .and_return({ gpu1: { base_url: 'http://gpu1:8080/v1', api_key: 'mlx-key' } })
-
+    it 'normalizes OpenAI-compatible /v1 settings roots' do
+      settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080/v1', api_key: 'mlx-key' } })
       instances = described_class.discover_instances
-
-      expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080',
-                                          mlx_api_key: 'mlx-key',
-                                          tier: :direct)
+      expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080', mlx_api_key: 'mlx-key', tier: :local)
     end
 
-    it 'combines local and settings instances' do
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:socket_open?)
-        .with('localhost', 8000, timeout: 0.1).and_return(true)
-      allow(Legion::Extensions::Llm::CredentialSources).to receive(:setting)
-        .with(:extensions, :llm, :mlx, :instances).and_return({ remote: { base_url: 'http://remote:8080' } })
-      expect(described_class.discover_instances.keys).to contain_exactly(:local, :remote)
+    it 'preserves an explicit operator tier instead of forcing one' do
+      settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080', tier: :direct } })
+      instances = described_class.discover_instances
+      expect(instances[:gpu1][:tier]).to eq(:direct)
+    end
+
+    it 'is the single source shared by the fleet responder enablement check' do
+      fleet = { respond_to_requests: true }
+      settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080', fleet: fleet } })
+      expect(Legion::Extensions::Llm::Fleet::ProviderResponder.enabled_for?(described_class.discover_instances))
+        .to be(true)
     end
   end
 
@@ -173,14 +168,5 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
   def fake_response(body)
     Struct.new(:body).new(body)
-  end
-
-  def stub_model_discovery
-    allow(provider.connection).to receive(:get).with('/v1/models').and_return(fake_response(models_body))
-  end
-
-  def stub_registry_publisher
-    allow(described_class::Provider).to receive(:registry_publisher).and_return(registry_publisher)
-    allow(registry_publisher).to receive(:publish_models_async)
   end
 end

@@ -1,5 +1,73 @@
 # Changelog
 
+## [0.5.2] - 2026-08-18
+
+### Fixed
+- Remove synthetic-default discovery filtering and its once-per-boot warning; configured discovery now returns every instance entry.
+
+## [0.5.1] - 2026-08-17
+
+### Changed
+- **Single actor registration** — the provider module no longer extends `Core` at file level, so the
+  boot-time submodule walk skips it and the gem's own top-level extension load is the sole actor
+  registration (eliminates the double-claim / `FencedPublisherError`).
+- The synthetic-default skip warn now fires once per boot instead of every discovery tick (was
+  permanent WARN noise — an unconfigured provider is the normal state).
+- **SSOT v3 fail-forward identity** — Instance identity is now the operator's config name
+  (`InstanceKey.instance_id` = the frozen config key the router uses for `instances.<name>`
+  lookups). The normalized endpoint `host:port` (plus optional API key SHA256 fingerprint) is
+  carried as the secondary `physical_id` for dedup and diagnostics only, never identity.
+  Two config names at the same endpoint remain distinct instances (no endpoint collapse).
+  All `Inventory::Publisher` calls now pass `physical_id:`.
+- Bump floor to `lex-llm >= 0.7.1` (carries the SSOT v3 `InstanceKey` `physical_id` and the
+  Publisher `physical_id:` kwargs; 0.7.0 publishers reject the `physical_id:` kwarg).
+
+### Added
+- Conformance coverage for config-name identity, secondary physical id, and no endpoint
+  collapse, plus an authoritative operation-evidence check pinning that embedding models
+  publish `chat`/`stream_chat` as `:unsupported` and `embed` as `:supported` so a plain chat
+  request cannot misroute to an embedding-only instance.
+
+## [0.5.0] - 2026-08-13
+
+### Changed
+- **SSOT v3 remediation pass 2** — Resolve all residual compliance violations from the first pass.
+- Remove source obfuscation: `UNKNOWN_EVIDENCE_SRC` constant restored to plain `:default_false` literal.
+- Remove second publication engine: `registry_publisher` class method and `attr_writer` removed from
+  `Provider`; `readiness` and `list_models` no longer call `publish_readiness_async` /
+  `publish_models_async` on the old `RegistryPublisher`. Single SSOT v3 `Inventory::Publisher` path only.
+- Remove regex-based authoritative capability claims: `extract_catalog_capabilities` and
+  `provider_envelope_capabilities` no longer promote model-name regex matches or hardcode streaming;
+  unverified capability support is unknown, not promoted to supported.
+- Fix `.rubocop.yml`: remove `RSpec/SpecFilePathFormat` `Exclude` entry for capability spec; rename
+  spec to `provider_capability_policy_spec.rb` to satisfy the path format cop cleanly.
+- Fix `settings.dig(:credentials, :api_key)` → `settings[:credentials][:api_key]` per §1.
+- Fix `settings[:endpoint] || 'http://localhost:8000'` → `settings[:endpoint]` (registered default).
+- Fix `api_base` to read the registered default from `settings[:instances][:default][:endpoint]`.
+- Fix swallowed `URI::InvalidURIError` rescue in `extract_host_port`: call `handle_exception` + re-raise.
+- Add `handle_exception` to `check_health` `Faraday::ConnectionFailed` and `StandardError` rescues.
+
+## [0.4.0] - 2026-08-13
+
+### Changed
+- **SSOT v3 provider migration** — Complete rewrite of `DiscoveryRefresh` actor to use `Inventory::Publisher`,
+  `OfferingDraft`, `ProbeCoordinator`, and `ReadinessResult` from lex-llm 0.7.0.
+- Add `MlxCallable` with `disconnect` / `normalize_dispatch_error(error:)` contracts for
+  `Inventory::CallableHandle` and `Routing::ProviderOutcome`.
+- Instance identity derived from normalized endpoint `host:port` plus optional API key SHA256 fingerprint.
+- Readiness probed via `/health` (non-inference, non-billable).
+- Embedding detection via model name pattern (`/embed|bge|e5|nomic/i`).
+- Operations: chat/stream_chat supported for non-embedding models; embed supported only for embedding models;
+  image/transcribe/translate/speak/moderate unsupported; count_tokens unknown.
+- Fleet worker passes `registry:` kwarg to `ProviderResponder.call` for exact-offering execution.
+- Remove all references to `Legion::LLM::Call::Registry` and `ScopedRefresher`.
+- Bump floor to `lex-llm >= 0.7.0`.
+
+### Added
+- Full SSOT v3 conformance spec (`mlx_ssot_v3_conformance_spec.rb`) exercising the shared
+  `'an SSOT v3 provider adapter'` examples plus MLX-specific identity, embedding, isolation,
+  and fleet execution contract tests.
+
 ## [0.3.14] - 2026-08-04
 
 ### Changed
