@@ -11,7 +11,6 @@ module Legion
       # Mlx provider extension namespace.
       module Mlx
         extend Legion::Logging::Helper
-        extend ::Legion::Extensions::Core if ::Legion::Extensions.const_defined?(:Core, false)
         extend Legion::Extensions::Llm::AutoRegistration
 
         PROVIDER_FAMILY = :mlx

@@ -3,6 +3,9 @@
 ## [0.5.1] - 2026-08-17
 
 ### Changed
+- **Single actor registration** — the provider module no longer extends `Core` at file level, so the
+  boot-time submodule walk skips it and the gem's own top-level extension load is the sole actor
+  registration (eliminates the double-claim / `FencedPublisherError`).
 - **SSOT v3 fail-forward identity** — Instance identity is now the operator's config name
   (`InstanceKey.instance_id` = the frozen config key the router uses for `instances.<name>`
   lookups). The normalized endpoint `host:port` (plus optional API key SHA256 fingerprint) is
