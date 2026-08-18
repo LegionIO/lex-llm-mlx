@@ -60,11 +60,6 @@ module Legion
           if cfg_instances.is_a?(Hash)
             cfg_instances.each do |name, config|
               normalized = normalize_instance_config(config)
-              if unconfigured_default?(name: name, normalized: normalized)
-                warn_unconfigured_default
-                next
-              end
-
               instances[name.to_sym] = normalized
             end
           end
@@ -89,21 +84,6 @@ module Legion
           @normalized_synthetic_default_instance ||= normalize_instance_config(
             default_settings.dig(:instances, :default) || {}
           )
-        end
-
-        # The unconfigured-default skip is the NORMAL state (an
-        # unconfigured provider), not a fault — the operator signal is
-        # loud exactly once per boot, then silent for the module's
-        # lifetime (every discovery tick would be permanent WARN noise).
-        # Module-level flag, same memo style as
-        # normalized_synthetic_default_instance. The predicate above
-        # guarantees the skipped name is :default, so the log line is a
-        # fixed string.
-        def self.warn_unconfigured_default
-          return if @synthetic_default_warned
-
-          @synthetic_default_warned = true
-          log.warn('[mlx][discovery] action=skip_instance instance=default reason=synthetic_default')
         end
 
         def self.normalize_instance_config(config)
@@ -134,7 +114,7 @@ module Legion
         end
 
         private_class_method :normalize_instance_config, :promote_api_base_aliases, :normalize_api_base,
-                             :resolve_instance_credentials, :warn_unconfigured_default
+                             :resolve_instance_credentials
 
         Legion::Extensions::Llm::Configuration.register_provider_options(Provider.configuration_options)
       end

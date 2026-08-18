@@ -74,49 +74,10 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       expect(described_class.discover_instances).to eq({})
     end
 
-    # D3: the synthetic instances.default section (the extension's own
-    # instance defaults, nested by provider_settings at boot) is an
-    # unconfigured phantom while it is unmodified — it must never reach
-    # the claim path. The actor's claimable set (tick_refresh iterates
-    # configured_instances into claim_and_activate_instance) excludes it.
-    it 'skips the synthetic default while it is the unmodified template (claimable set)' do
+    it 'includes the default template in the claimable set' do
       settings_tree.replace(instances: { default: synthetic_default })
 
-      expect(described_class.configured_instances).to eq({})
-    end
-
-    # The unconfigured-default skip is the NORMAL state — the operator
-    # signal ("default is still the unmodified template; set a real
-    # endpoint to publish it") must be loud on first skip but not
-    # per-tick WARN spam. The throttle is a module-lifetime flag (once
-    # per boot), so the spec resets it first: it is process-wide state,
-    # and earlier examples already latch it.
-    it 'warns about the synthetic default exactly once per boot across ticks' do
-      described_class.instance_variable_set(:@synthetic_default_warned, false)
-      settings_tree.replace(instances: { default: synthetic_default })
-      warnings = []
-      fake_log = Object.new
-      fake_log.define_singleton_method(:warn) { |message = nil, **| warnings << message.to_s }
-      allow(described_class).to receive(:log).and_return(fake_log)
-
-      expect(described_class.configured_instances).to eq({})
-      expect(described_class.configured_instances).to eq({})
-
-      expect(warnings.size).to eq(1), 'the template skip must be loud but not per-tick spam'
-      expect(warnings.first).to include('action=skip_instance')
-      expect(warnings.first).to include('reason=synthetic_default')
-      expect(described_class.instance_variable_get(:@synthetic_default_warned)).to be(true)
-    end
-
-    it 'excludes the synthetic default from the fleet-responder discovery set' do
-      settings_tree.replace(instances: { default: synthetic_default })
-
-      # discover_instances is the exact input to FleetWorker#enabled?'s
-      # ProviderResponder.enabled_for? — the phantom localhost instance
-      # must not be in it.
-      expect(described_class.discover_instances).to eq({})
-      expect(Legion::Extensions::Llm::Fleet::ProviderResponder.enabled_for?(described_class.discover_instances))
-        .to be(false)
+      expect(described_class.configured_instances).to have_key(:default)
     end
 
     # A configured (non-template) instances.default — a real operator
