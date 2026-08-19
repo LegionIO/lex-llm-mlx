@@ -351,8 +351,8 @@ module Legion
             # selection. Compare every OfferingDraft field (including the stored weight
             # pair) while removing only those volatile evidence timestamps.
             def offerings_equivalent?(previous, current)
-              Array(previous).map { |draft| offering_comparison_state(draft) } ==
-                Array(current).map { |draft| offering_comparison_state(draft) }
+              Array(previous).map { |draft| offering_comparison_state(draft) }.tally ==
+                Array(current).map { |draft| offering_comparison_state(draft) }.tally
             end
 
             def offering_comparison_state(draft)

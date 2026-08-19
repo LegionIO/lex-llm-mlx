@@ -10,6 +10,7 @@
 
 ### Fixed
 - Compare every offering contract field while excluding only non-authoritative evidence observation timestamps, preventing unchanged discovery passes from republishing snapshots while retaining real evidence and weight changes.
+- Treat discovery catalogs as order-independent multisets, so provider reorderings do not republish while adding or removing a duplicate offering remains a significant change.
 - Validate the complete weighted offering set before constructing or claiming a callable scope, so malformed weights leave no orphaned Registry publication and a later corrected ordinary pass activates without restart or operator cleanup.
 
 ### Added

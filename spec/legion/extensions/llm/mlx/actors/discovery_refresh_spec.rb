@@ -365,6 +365,44 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       expect(actor.send(:offerings_equivalent?, [first], [second])).to be(true)
     end
 
+    it 'does not replace an equivalent catalog returned in a different order' do
+      configure_weights
+      catalog = [
+        { id: 'model-a', max_model_len: 4096 },
+        { id: 'model-b', max_model_len: 8192 }
+      ]
+      allow(actor).to receive(:fetch_models).and_return(catalog, catalog.reverse)
+      publisher = actor.send(:publisher)
+      replacements = replace_calls_for(publisher)
+
+      actor.manual
+      state = actor.instance_variable_get(:@instance_states).fetch('studio')
+      actor.manual
+
+      expect(replacements).to be_empty
+      expect(state.fetch(:sequence)).to eq(0)
+    end
+
+    it 'replaces once when an otherwise duplicate offering is added' do
+      configure_weights
+      catalog = [
+        { id: 'model-a', max_model_len: 4096 },
+        { id: 'model-b', max_model_len: 8192 }
+      ]
+      allow(actor).to receive(:fetch_models).and_return(catalog, catalog + [catalog.first])
+      publisher = actor.send(:publisher)
+      replacements = []
+      allow(publisher).to receive(:replace_instance_snapshot) { |**kwargs| replacements << kwargs }
+
+      actor.manual
+      state = actor.instance_variable_get(:@instance_states).fetch('studio')
+      actor.manual
+
+      expect(replacements.length).to eq(1)
+      expect(replacements.first.fetch(:offerings).length).to eq(3)
+      expect(state.fetch(:sequence)).to eq(1)
+    end
+
     it 'publishes when contract evidence content changes' do
       configure_weights
       publisher = actor.send(:publisher)
