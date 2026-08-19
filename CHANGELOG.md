@@ -10,6 +10,7 @@
 
 ### Fixed
 - Compare every offering contract field while excluding only non-authoritative evidence observation timestamps, preventing unchanged discovery passes from republishing snapshots while retaining real evidence and weight changes.
+- Validate the complete weighted offering set before constructing or claiming a callable scope, so malformed weights leave no orphaned Registry publication and a later corrected ordinary pass activates without restart or operator cleanup.
 
 ### Added
 - Cover the complete writer lifecycle, publication races, failure atomicity, dormant-state cycle, and the actual callable's folded-system OpenAI-compatible wire payload.

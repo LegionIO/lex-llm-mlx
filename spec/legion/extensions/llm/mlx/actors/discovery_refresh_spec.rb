@@ -387,6 +387,31 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       expect { build_weighted_draft }.to raise_error(ArgumentError, /Integer >= 0/)
     end
 
+    it 'leaves no claimed scope for malformed weights and cleanly retries after correction' do
+      publisher = actor.send(:publisher)
+      allow(publisher).to receive(:claim_instance).and_call_original
+      configure_weights(provider: false)
+
+      actor.manual
+
+      snapshot = registry.snapshot
+      expect(publisher).not_to have_received(:claim_instance)
+      expect(snapshot.each_publication_status.to_a).to be_empty
+      expect(snapshot.each_instance.to_a).to be_empty
+      expect(snapshot.each_offering.to_a).to be_empty
+      expect(actor.instance_variable_get(:@instance_states)).to be_empty
+
+      settings_tree[:weight] = 100
+      actor.manual
+      actor.manual
+
+      expect(publisher).to have_received(:claim_instance).once
+      expect(registry.snapshot.publication_status(instance_key: studio_key).state).to eq(:complete)
+      expect(registry.snapshot.each_instance.to_a.size).to eq(1)
+      expect(registry.snapshot.offerings_for(instance_key: studio_key).size).to eq(1)
+      expect(actor.instance_variable_get(:@instance_states).fetch('studio')[:published]).to be(true)
+    end
+
     it 'logs the complete dormant cycle once per disappearance on ordinary passes' do
       ghost_key = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
         provider_family: :mlx, instance_id: 'ghost', physical_id: 'ghost.local:8000'

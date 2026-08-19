@@ -815,6 +815,7 @@ module Legion
               instance_id = name.to_s
               physical_id = derive_physical_id(instance_cfg: instance_cfg)
               instance_key = build_instance_key(instance_id: instance_id, physical_id: physical_id)
+              offerings = discover_offerings_for_instance(instance_cfg: instance_cfg, instance_key: instance_key)
               callable = Legion::Extensions::Llm::Mlx::Actor::MlxCallable.new(instance_cfg: instance_cfg, logger: log)
               probe_coordinator = build_probe_coordinator(instance_id: instance_id, instance_key: instance_key)
               publisher_token = publisher.claim_instance(
@@ -823,16 +824,15 @@ module Legion
               )
               run_activation(
                 instance_id: instance_id, publisher_token: publisher_token,
+                offerings: offerings,
                 instance_desc: { name: name, instance_id: instance_id, physical_id: physical_id,
                                  instance_key: instance_key, instance_cfg: instance_cfg,
                                  callable: callable, probe_coordinator: probe_coordinator }
               )
             end
 
-            def run_activation(instance_id:, publisher_token:, instance_desc:)
+            def run_activation(instance_id:, publisher_token:, offerings:, instance_desc:)
               instance_cfg = instance_desc[:instance_cfg]
-              instance_key = instance_desc[:instance_key]
-              offerings = discover_offerings_for_instance(instance_cfg: instance_cfg, instance_key: instance_key)
               state = build_instance_state(
                 **instance_desc, publisher_token: publisher_token, offerings: offerings
               )
