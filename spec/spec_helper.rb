@@ -59,4 +59,12 @@ if defined?(Legion::Logging)
     }.freeze
   )
   Legion::Logging.instance_variable_set(:@configuration_generation, Legion::Logging.configuration_generation + 1)
+
+  # Provider helpers dispatch through this tagged boundary; keep the full
+  # file-directed RSpec run free of unrelated runtime log output.
+  RSpec.configure do |config|
+    config.before do
+      allow(Legion::Logging).to receive(:emit_tagged)
+    end
+  end
 end

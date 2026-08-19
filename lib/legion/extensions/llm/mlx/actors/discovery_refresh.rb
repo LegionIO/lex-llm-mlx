@@ -21,6 +21,7 @@ require 'legion/extensions/llm/inventory/identity'
 require 'legion/extensions/llm/inventory/records'
 require 'legion/extensions/llm/inventory/evidence'
 require 'legion/extensions/llm/inventory/probe_coordinator'
+require 'legion/extensions/llm/inventory/weight_reconciler'
 require 'legion/extensions/llm/routing/provider_outcome'
 require 'legion/extensions/llm/taxonomies'
 require 'legion/extensions/llm/capabilities'
@@ -46,6 +47,13 @@ module Legion
             def build_offering_draft(model_id:, model_data:, instance_cfg:, instance_key:)
               tier = instance_cfg[:tier] || :local
               embed_supported = embedding_model?(model_id: model_id)
+              weight_inputs = Legion::Extensions::Llm::Inventory::WeightSchema.weight_inputs(
+                settings: Legion::Settings,
+                instance_key: instance_key,
+                provider_native_key: model_id,
+                model: model_id,
+                tier: tier
+              )
 
               Legion::Extensions::Llm::Inventory::OfferingDraft.new(
                 provider_native_key: model_id,
@@ -62,7 +70,9 @@ module Legion
                 tokenizer_evidence: absent_value_evidence,
                 quota_domains: {},
                 metadata: build_offering_metadata(model_data: model_data, instance_key: instance_key),
-                publication_source: :provider_catalog
+                publication_source: :provider_catalog,
+                weight_inputs: weight_inputs,
+                base_weight: Legion::Extensions::Llm::Inventory::WeightSchema.base_weight(weight_inputs)
               )
             end
 
@@ -239,8 +249,7 @@ module Legion
 
             def readiness_failure(reason:, error:)
               Legion::Extensions::Llm::Inventory::ReadinessResult.new(
-                ready: false, reason: reason,
-                metadata: { error_class: error.class.name }
+                ready: false, reason:, metadata: { error_class: error.class.name }
               )
             end
 
@@ -254,9 +263,9 @@ module Legion
               )
               readiness = check_health(instance_cfg: state[:instance_cfg])
               coordinator.finish_probe
-              report_probe_result(
+              commit_probe_result(
                 instance_id: instance_id, physical_id: state[:physical_id],
-                probe_token: probe_token, readiness: readiness
+                probe_token: probe_token, readiness: readiness, state: state
               )
             rescue StandardError => e
               begin
@@ -268,21 +277,15 @@ module Legion
             end
 
             def handle_reactive_probe(instance_id:, request:)
-              state = @instance_states[instance_id]
+              state = state_mutex.synchronize { @instance_states[instance_id] }
               return unless state
 
               coordinator = state[:probe_coordinator]
               return unless coordinator.begin_probe(request: request)
 
-              probe_token = publisher.readiness_probe_started(
-                instance_id: instance_id, physical_id: state[:physical_id],
-                publisher_token: state[:publisher_token]
-              )
-              readiness = check_health(instance_cfg: state[:instance_cfg])
-              coordinator.finish_probe(request: request)
-              report_probe_result(
-                instance_id: instance_id, physical_id: state[:physical_id],
-                probe_token: probe_token, readiness: readiness
+              perform_reactive_probe(
+                instance_id: instance_id, request: request,
+                state: state, coordinator: coordinator
               )
             rescue StandardError => e
               begin
@@ -293,15 +296,33 @@ module Legion
               handle_exception(e, level: :warn, operation: 'mlx.actor.reactive_probe', instance_id: instance_id)
             end
 
-            def report_probe_result(instance_id:, physical_id:, probe_token:, readiness:)
-              if readiness.ready?
-                publisher.readiness_succeeded(
-                  instance_id: instance_id, physical_id: physical_id, probe_token: probe_token
-                )
-              else
-                publisher.readiness_failed(
-                  instance_id: instance_id, physical_id: physical_id, probe_token: probe_token, reason: readiness.reason
-                )
+            def perform_reactive_probe(instance_id:, request:, state:, coordinator:)
+              probe_token = publisher.readiness_probe_started(
+                instance_id: instance_id, physical_id: state[:physical_id],
+                publisher_token: state[:publisher_token]
+              )
+              readiness = check_health(instance_cfg: state[:instance_cfg])
+              coordinator.finish_probe(request: request)
+              commit_probe_result(
+                instance_id: instance_id, physical_id: state[:physical_id],
+                probe_token: probe_token, readiness: readiness, state: state
+              )
+            end
+
+            def commit_probe_result(instance_id:, physical_id:, probe_token:, readiness:, state:)
+              state_mutex.synchronize do
+                return unless @instance_states[instance_id].equal?(state)
+
+                if readiness.ready?
+                  publisher.readiness_succeeded(
+                    instance_id: instance_id, physical_id: physical_id, probe_token: probe_token
+                  )
+                else
+                  publisher.readiness_failed(
+                    instance_id: instance_id, physical_id: physical_id,
+                    probe_token: probe_token, reason: readiness.reason
+                  )
+                end
               end
             end
 
@@ -316,6 +337,135 @@ module Legion
             end
           end
 
+          # MLX offering comparison excludes only evidence observation telemetry.
+          module OfferingComparison
+            OFFERING_SCALAR_EVIDENCE_FIELDS = %i[
+              context_evidence max_output_evidence embedding_dimensions_evidence
+              model_revision_evidence tokenizer_evidence
+            ].freeze
+
+            private
+
+            # Inventory evidence timestamps are telemetry only: Evidence explicitly
+            # excludes observed_at from authority, ordering, freshness, recovery, and
+            # selection. Compare every OfferingDraft field (including the stored weight
+            # pair) while removing only those volatile evidence timestamps.
+            def offerings_equivalent?(previous, current)
+              Array(previous).map { |draft| offering_comparison_state(draft) }.tally ==
+                Array(current).map { |draft| offering_comparison_state(draft) }.tally
+            end
+
+            def offering_comparison_state(draft)
+              state = draft.to_h
+              state[:operation_evidence] = comparison_evidence_map(draft.operation_evidence)
+              state[:capability_evidence] = comparison_evidence_map(draft.capability_evidence)
+              OFFERING_SCALAR_EVIDENCE_FIELDS.each do |field|
+                state[field] = comparison_evidence(draft.public_send(field))
+              end
+              state
+            end
+
+            def comparison_evidence_map(evidence)
+              evidence.transform_values { |entry| comparison_evidence(entry) }
+            end
+
+            def comparison_evidence(evidence)
+              evidence.to_h.except(:observed_at)
+            end
+          end
+
+          # MLX bindings for the shared writer reconciler. This module owns only
+          # actor-local publication synchronization and dormant tracking used by
+          # the existing discovery cadence.
+          module WeightPublication
+            private
+
+            def replace_offerings_if_changed(instance_id:, state:)
+              new_offerings = discover_offerings_for_instance(
+                instance_cfg: state[:instance_cfg], instance_key: state[:instance_key]
+              )
+              Legion::Extensions::Llm::Inventory::WeightReconciler.commit_if_changed!(
+                settings: Legion::Settings,
+                instance_id: instance_id,
+                state: state,
+                discovered_offerings: new_offerings,
+                mutex: state_mutex,
+                equivalent: method(:offerings_equivalent?),
+                replace: method(:replace_weight_snapshot)
+              )
+            end
+
+            def replace_weight_snapshot(instance_id:, state:, offerings:, sequence:)
+              publisher.replace_instance_snapshot(
+                instance_id: instance_id,
+                publisher_token: state.fetch(:publisher_token),
+                offerings: offerings,
+                sequence: sequence,
+                physical_id: state.fetch(:physical_id)
+              )
+            end
+
+            def commit_readiness(instance_id:, probe_token:, readiness:, state:)
+              if readiness.ready?
+                return Legion::Extensions::Llm::Inventory::WeightReconciler.activate_tracked!(
+                  settings: Legion::Settings,
+                  instance_id: instance_id,
+                  state_key: instance_id,
+                  state: state,
+                  states: @instance_states,
+                  mutex: state_mutex,
+                  probe_token: probe_token,
+                  activate: method(:activate_weight_snapshot),
+                  activation_sequence: ->(tracked) { tracked.fetch(:sequence) }
+                )
+              end
+
+              state_mutex.synchronize do
+                return false unless @instance_states[instance_id].equal?(state)
+
+                publisher.readiness_failed(
+                  instance_id: instance_id, physical_id: state[:physical_id],
+                  probe_token: probe_token, reason: readiness.reason
+                )
+              end
+              true
+            end
+
+            def activate_weight_snapshot(instance_id:, state:, offerings:, sequence:, probe_token:)
+              publisher.activate_instance_snapshot(
+                instance_id: instance_id,
+                publisher_token: state.fetch(:publisher_token),
+                offerings: offerings,
+                sequence: sequence,
+                probe_token: probe_token,
+                physical_id: state.fetch(:physical_id)
+              )
+            end
+
+            def observe_dormant_weights
+              Legion::Extensions::Llm::Inventory::WeightReconciler.observe_dormant!(
+                settings: Legion::Settings,
+                provider_family: :mlx,
+                states: @instance_states,
+                mutex: state_mutex,
+                tracker: dormant_weight_tracker,
+                dormant_logger: lambda do |key|
+                  log.info(
+                    "[llm][mlx] action=dormant_weight weight_key=#{key.inspect} no_lane_published=true"
+                  )
+                end
+              )
+            end
+
+            def state_mutex
+              @state_mutex ||= Mutex.new
+            end
+
+            def dormant_weight_tracker
+              @dormant_weight_tracker ||= Legion::Extensions::Llm::Inventory::DormantWeightTracker.new
+            end
+          end
+
           # Periodic refresh cycle — included by DiscoveryRefresh. Each tick
           # re-scans the configured instances (late configuration appears
           # without a restart; removed instances are reconciled out),
@@ -326,30 +476,40 @@ module Legion
             private
 
             def tick_refresh
-              @instance_states ||= {}
+              instance_states
               configured_ids = {}
               configured_instances.each do |name, instance_cfg|
-                # Identity is the operator's CONFIG NAME — the key the
-                # frozen config uses and the router keys instances.<name>
-                # settings lookups by. Two names at the same endpoint stay
-                # distinct instances (the physical id is secondary).
-                instance_id = name.to_s
-                configured_ids[instance_id] = true
-                state = @instance_states[instance_id]
-                if state.nil?
-                  claim_and_activate_instance(name: name, instance_cfg: instance_cfg)
-                else
-                  refresh_instance(instance_id: instance_id, name: name, state: state)
-                end
-              rescue StandardError => e
-                handle_exception(e, level: :warn, operation: 'mlx.actor.tick_refresh', instance_name: name.to_s)
+                reconcile_configured_instance(
+                  name: name, instance_cfg: instance_cfg, configured_ids: configured_ids
+                )
               end
 
               remove_unconfigured_instances(configured_ids: configured_ids)
+              observe_dormant_weights
+            end
+
+            def instance_states
+              state_mutex.synchronize { @instance_states ||= {} }
+            end
+
+            # Identity is the operator's config name — the key the frozen config
+            # and router use. Two names at one endpoint remain distinct instances.
+            def reconcile_configured_instance(name:, instance_cfg:, configured_ids:)
+              instance_id = name.to_s
+              configured_ids[instance_id] = true
+              state = state_mutex.synchronize { @instance_states[instance_id] }
+              if state.nil?
+                claim_and_activate_instance(name: name, instance_cfg: instance_cfg)
+              else
+                refresh_instance(instance_id: instance_id, name: name, state: state)
+              end
+            rescue StandardError => e
+              handle_exception(e, level: :warn, operation: 'mlx.actor.tick_refresh', instance_name: name.to_s)
             end
 
             def remove_unconfigured_instances(configured_ids:)
-              @instance_states.each do |instance_id, state|
+              states = state_mutex.synchronize { @instance_states.to_a }
+              states.each do |instance_id, state|
                 next if configured_ids.key?(instance_id)
 
                 remove_instance_state(instance_id: instance_id, state: state)
@@ -360,12 +520,18 @@ module Legion
             end
 
             def remove_instance_state(instance_id:, state:)
-              publisher.remove_instance(
-                instance_id: instance_id, physical_id: state[:physical_id],
-                publisher_token: state[:publisher_token]
-              )
-              clear_instance_health(config_name: state[:name])
-              @instance_states.delete(instance_id)
+              removed = state_mutex.synchronize do
+                next false unless @instance_states[instance_id].equal?(state)
+
+                publisher.remove_instance(
+                  instance_id: instance_id, physical_id: state[:physical_id],
+                  publisher_token: state[:publisher_token]
+                )
+                @instance_states.delete(instance_id)
+                true
+              end
+              clear_instance_health(config_name: state[:name]) if removed
+              removed
             end
 
             def refresh_instance(instance_id:, name:, state:)
@@ -380,21 +546,6 @@ module Legion
               write_instance_health(config_name: name, state: state)
             end
 
-            def replace_offerings_if_changed(instance_id:, state:)
-              new_offerings = discover_offerings_for_instance(
-                instance_cfg: state[:instance_cfg], instance_key: state[:instance_key]
-              )
-              return if new_offerings == state[:offerings]
-
-              state[:sequence] += 1
-              publisher.replace_instance_snapshot(
-                instance_id: instance_id, physical_id: state[:physical_id],
-                publisher_token: state[:publisher_token],
-                offerings: new_offerings, sequence: state[:sequence]
-              )
-              state[:offerings] = new_offerings
-            end
-
             # Initial-failure recovery: an instance stuck at :initializing
             # (readiness failed at boot, e.g. transient outage) re-activates
             # on the first healthy probe. While :initializing,
@@ -405,34 +556,24 @@ module Legion
               offerings = discover_offerings_for_instance(
                 instance_cfg: state[:instance_cfg], instance_key: state[:instance_key]
               )
+              Legion::Extensions::Llm::Inventory::WeightReconciler.commit_if_changed!(
+                settings: Legion::Settings,
+                instance_id: instance_id,
+                state: state,
+                discovered_offerings: offerings,
+                mutex: state_mutex,
+                equivalent: method(:offerings_equivalent?),
+                replace: method(:replace_weight_snapshot)
+              )
               probe_token = publisher.readiness_probe_started(
                 instance_id: instance_id, publisher_token: state[:publisher_token]
               )
               readiness = check_health(instance_cfg: state[:instance_cfg])
-              commit_readiness(instance_id: instance_id, offerings: offerings,
-                               probe_token: probe_token, readiness: readiness, state: state)
-              write_instance_health(config_name: name, state: state)
-            end
-
-            # Shared commit for initial and recovery activation: on a
-            # healthy probe activate the snapshot (the only legal commit
-            # from :initializing), otherwise record the failed readiness.
-            # The sequence is the instance state's sequence (0 until the
-            # first replace after activation).
-            def commit_readiness(instance_id:, offerings:, probe_token:, readiness:, state:)
-              if readiness.ready?
-                publisher.activate_instance_snapshot(
-                  instance_id: instance_id, physical_id: state[:physical_id],
-                  publisher_token: state[:publisher_token],
-                  offerings: offerings, sequence: state[:sequence], probe_token: probe_token
-                )
-                state[:offerings] = offerings
-              else
-                publisher.readiness_failed(
-                  instance_id: instance_id, physical_id: state[:physical_id],
-                  probe_token: probe_token, reason: readiness.reason
-                )
-              end
+              committed = commit_readiness(
+                instance_id: instance_id, probe_token: probe_token,
+                readiness: readiness, state: state
+              )
+              write_instance_health(config_name: name, state: state) if committed
             end
           end
 
@@ -489,7 +630,7 @@ module Legion
             end
 
             def build_instance_state(**attrs)
-              attrs.merge(sequence: 0)
+              attrs.merge(sequence: 0, published: false)
             end
           end
 
@@ -622,6 +763,8 @@ module Legion
             include ValueEvidenceBuilding
             include OfferingAssembly
             include HealthProbing
+            include OfferingComparison
+            include WeightPublication
             include TickCycle
             include InstanceConfig
             include HealthDisplay
@@ -672,6 +815,7 @@ module Legion
               instance_id = name.to_s
               physical_id = derive_physical_id(instance_cfg: instance_cfg)
               instance_key = build_instance_key(instance_id: instance_id, physical_id: physical_id)
+              offerings = discover_offerings_for_instance(instance_cfg: instance_cfg, instance_key: instance_key)
               callable = Legion::Extensions::Llm::Mlx::Actor::MlxCallable.new(instance_cfg: instance_cfg, logger: log)
               probe_coordinator = build_probe_coordinator(instance_id: instance_id, instance_key: instance_key)
               publisher_token = publisher.claim_instance(
@@ -680,42 +824,50 @@ module Legion
               )
               run_activation(
                 instance_id: instance_id, publisher_token: publisher_token,
+                offerings: offerings,
                 instance_desc: { name: name, instance_id: instance_id, physical_id: physical_id,
                                  instance_key: instance_key, instance_cfg: instance_cfg,
                                  callable: callable, probe_coordinator: probe_coordinator }
               )
             end
 
-            def run_activation(instance_id:, publisher_token:, instance_desc:)
+            def run_activation(instance_id:, publisher_token:, offerings:, instance_desc:)
               instance_cfg = instance_desc[:instance_cfg]
-              instance_key = instance_desc[:instance_key]
-              offerings = discover_offerings_for_instance(instance_cfg: instance_cfg, instance_key: instance_key)
-              probe_token = publisher.readiness_probe_started(instance_id: instance_id,
-                                                              publisher_token: publisher_token)
-              readiness = check_health(instance_cfg: instance_cfg)
               state = build_instance_state(
                 **instance_desc, publisher_token: publisher_token, offerings: offerings
               )
-              commit_readiness(instance_id: instance_id, offerings: offerings,
-                               probe_token: probe_token, readiness: readiness, state: state)
-              @instance_states[instance_id] = state
-              write_instance_health(config_name: instance_desc[:name], state: state)
+              Legion::Extensions::Llm::Inventory::WeightReconciler.track_initializing!(
+                states: @instance_states,
+                state_key: instance_id,
+                state: state,
+                mutex: state_mutex
+              )
+              probe_token = publisher.readiness_probe_started(instance_id: instance_id,
+                                                              publisher_token: publisher_token)
+              readiness = check_health(instance_cfg: instance_cfg)
+              committed = commit_readiness(
+                instance_id: instance_id, probe_token: probe_token,
+                readiness: readiness, state: state
+              )
+              write_instance_health(config_name: instance_desc[:name], state: state) if committed
             end
 
             def remove_all_instances
-              return unless @instance_states
+              states = state_mutex.synchronize do
+                return if @instance_states.nil?
 
-              @instance_states.each do |instance_id, state|
-                publisher.remove_instance(
-                  instance_id: instance_id, physical_id: state[:physical_id],
-                  publisher_token: state[:publisher_token]
-                )
-                clear_instance_health(config_name: state[:name])
+                @instance_states.to_a
+              end
+              states.each do |instance_id, state|
+                remove_instance_state(instance_id: instance_id, state: state)
               rescue StandardError => e
                 handle_exception(e, level: :warn, operation: 'mlx.actor.remove_instance',
                                     instance_id: instance_id)
               end
-              @instance_states.clear
+              state_mutex.synchronize do
+                @instance_states.clear
+                dormant_weight_tracker.clear!
+              end
             end
           end
 
