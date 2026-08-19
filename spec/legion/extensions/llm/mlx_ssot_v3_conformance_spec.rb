@@ -1032,6 +1032,27 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       expect(callable.call_count).to eq(1)
     end
 
+    it 'renders the folded system message in the native OpenAI-compatible wire payload' do
+      captured = []
+      connection = instance_double(Legion::Extensions::Llm::Connection)
+      allow(connection).to receive(:post) do |url, payload|
+        captured << { url: url, payload: payload }
+        ssot_harness.stub_completion_response
+      end
+      callable.send(:provider).instance_variable_set(:@connection, connection)
+      messages = [
+        Legion::Extensions::Llm::Canonical::Message.build(role: :system, content: 'system from dispatch fold'),
+        Legion::Extensions::Llm::Canonical::Message.build(role: :user, content: 'hello')
+      ]
+
+      callable.chat(messages: messages, model: 'mlx-community/Llama-3.2-3B-Instruct-4bit')
+
+      expect(captured.length).to eq(1)
+      expect(captured.first[:url]).to eq('/v1/chat/completions')
+      expect(captured.first.dig(:payload, :messages).first)
+        .to eq(role: 'system', content: 'system from dispatch fold')
+    end
+
     it 'counts each dispatch op as an inference call' do
       message = Legion::Extensions::Llm::Message.new(role: :user, content: 'hello')
       callable.chat(messages: [message], model: 'm/v1')

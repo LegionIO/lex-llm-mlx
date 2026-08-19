@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.3] - 2026-08-19
+
+### Changed
+- Publish the immutable four-component lane-weight pair from MLX discovery and reconcile weight-only changes on the existing scheduled writer pass.
+- Serialize initial, recovery, replacement, removal, and shutdown state transitions behind one actor-local mutex without adding a Settings callback or operator workflow.
+- Track configured-but-unpublished weight keys on the existing discovery cadence and log each dormant transition once.
+- Raise the `lex-llm` dependency floor to 0.7.6; the existing `legion-settings` dependency remains unchanged.
+
+### Fixed
+- Compare every offering contract field while excluding only non-authoritative evidence observation timestamps, preventing unchanged discovery passes from republishing snapshots while retaining real evidence and weight changes.
+
+### Added
+- Cover the complete writer lifecycle, publication races, failure atomicity, dormant-state cycle, and the actual callable's folded-system OpenAI-compatible wire payload.
+
 ## [0.5.2] - 2026-08-18
 
 ### Fixed
