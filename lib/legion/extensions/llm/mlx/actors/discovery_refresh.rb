@@ -912,12 +912,17 @@ module Legion
 
             def chat(messages:, model:, **rest)
               record_inference
+              # Canonical boundary (N x N law): pipeline dispatch delivers
+              # Canonical::Message objects only. Hash/legacy shapes are the
+              # bypass class — reject loudly, never coerce.
+              provider.enforce_canonical_messages!(messages)
               named, params = split_fleet_kwargs(rest, COMPLETION_NAMED_KEYS)
               provider.chat(messages: messages, model: model_info(model), params: params, **named)
             end
 
             def stream_chat(messages:, model:, **rest, &)
               record_inference
+              provider.enforce_canonical_messages!(messages)
               named, params = split_fleet_kwargs(rest, COMPLETION_NAMED_KEYS)
               provider.stream_chat(messages: messages, model: model_info(model), params: params, **named, &)
             end
@@ -930,6 +935,7 @@ module Legion
 
             def count_tokens(messages:, model:, **rest)
               record_inference
+              provider.enforce_canonical_messages!(messages)
               _named, params = split_fleet_kwargs(rest, [])
               provider.count_tokens(messages: messages, model: model, params: params)
             end

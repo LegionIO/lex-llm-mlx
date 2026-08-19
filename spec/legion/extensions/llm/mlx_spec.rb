@@ -140,6 +140,9 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   end
 
   def chat_payload
+    # The provider-native lex-llm Message is the Chat-facade shape; the render
+    # seam accepts it (alongside Canonical::Message) and only rejects plain
+    # Hashes — so the wire payload is identical to the dispatch path.
     message = Legion::Extensions::Llm::Message.new(role: :user, content: 'hello')
     provider.send(:render_payload, [message], tools: {}, temperature: 0.2, model: model, stream: false,
                                               schema: nil, thinking: nil, tool_prefs: nil)

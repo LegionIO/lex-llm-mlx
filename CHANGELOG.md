@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.4] - 2026-08-19
+
+### Changed
+- Enforce the canonical dispatch boundary end to end: the `MlxCallable` dispatch operations (chat, stream_chat, count_tokens) now call `Provider#enforce_canonical_messages!` before delegating, and the provider's render seam rejects plain-Hash messages with a loud `ArgumentError` instead of letting them reach the inherited OpenAI-compatible renderer (which would raise `NoMethodError`). The lenient hash re-canonicalization masked the 2026-08-19 hash-bypass defect for 25 failed openai dispatches; that masking path is removed.
+- Raise the `lex-llm` dependency floor to 0.7.7 for `Provider#enforce_canonical_messages!`.
+- Add a local-tree `lex-llm` path dependency to the test group so the adjacent checkout resolves against unreleased 0.7.7 during development.
+
+### Added
+- Cover the canonical boundary in the `MlxCallable` conformance block: plain-Hash input raises at both the callable dispatch boundary and the provider render seam, while canonical and provider-native message shapes still render the identical OpenAI-compatible wire payload.
+
 ## [0.5.3] - 2026-08-19
 
 ### Changed

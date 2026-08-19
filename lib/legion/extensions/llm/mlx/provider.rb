@@ -232,6 +232,29 @@ module Legion
 
           private
 
+          # Canonical boundary (N x N law): pipeline dispatch delivers
+          # Canonical::Message objects; the provider-native Chat facade
+          # delivers lex-llm Message. Both are object shapes the inherited
+          # OpenAI-compatible render reads via .role/.content. Plain Hashes are
+          # the bypass class (the 2026-08-19 incident) — reject loudly at the
+          # render seam rather than letting them reach the inherited renderer
+          # (NoMethodError) and mask the bypass.
+          def render_payload(messages, **opts)
+            enforce_render_message_boundary!(messages)
+            super
+          end
+
+          def enforce_render_message_boundary!(messages)
+            Array(messages).each do |msg|
+              next if msg.is_a?(Legion::Extensions::Llm::Canonical::Message)
+              next if msg.is_a?(Legion::Extensions::Llm::Message)
+
+              raise ArgumentError,
+                    "mlx provider input must be Canonical::Message objects, got #{msg.class} — " \
+                    'non-canonical message shapes must not cross the dispatch boundary'
+            end
+          end
+
           def build_offering_kwargs(model_info:, policy:, health:)
             {
               provider_family: :mlx,
