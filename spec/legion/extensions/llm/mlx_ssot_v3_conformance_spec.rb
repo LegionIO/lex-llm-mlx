@@ -1027,10 +1027,10 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       # Pipeline dispatch delivers Canonical::Message objects (N x N law); the
       # dispatch boundary rejects anything else loudly.
       message = Legion::Extensions::Llm::Canonical::Message.build(role: :user, content: 'hello')
-      result = callable.chat(messages: [message], model: 'mlx-community/Llama-3.2-3B-Instruct-4bit',
-                             max_tokens: 100)
-      expect(result).to be_a(Legion::Extensions::Llm::Message)
-      expect(result.content).to eq('ssot stub response')
+      result = callable.chat([message], model: 'mlx-community/Llama-3.2-3B-Instruct-4bit',
+                                        max_tokens: 100)
+      expect(result).to be_a(Legion::Extensions::Llm::Canonical::Response)
+      expect(result.text).to eq('ssot stub response')
       expect(callable.call_count).to eq(1)
     end
 
@@ -1047,7 +1047,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
         Legion::Extensions::Llm::Canonical::Message.build(role: :user, content: 'hello')
       ]
 
-      callable.chat(messages: messages, model: 'mlx-community/Llama-3.2-3B-Instruct-4bit')
+      callable.chat(messages, model: 'mlx-community/Llama-3.2-3B-Instruct-4bit')
 
       expect(captured.length).to eq(1)
       expect(captured.first[:url]).to eq('/v1/chat/completions')
@@ -1057,7 +1057,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     it 'counts each dispatch op as an inference call' do
       message = Legion::Extensions::Llm::Canonical::Message.build(role: :user, content: 'hello')
-      callable.chat(messages: [message], model: 'm/v1')
+      callable.chat([message], model: 'm/v1')
       callable.count_tokens(messages: [message], model: 'm/v1')
       expect(callable.call_count).to eq(2)
     end
@@ -1066,32 +1066,23 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     it 'rejects plain Hash messages at the dispatch boundary instead of re-canonicalizing them' do
       # The 2026-08-19 defect class: hash messages silently re-canonicalized
       # provider-side masked the bypass for 25 failed openai dispatches. The
-      # boundary now rejects loudly at both the callable and the render seam.
+      # boundary rejects loudly on every dispatch operation (callable entry,
+      # 12/O05; the base funnel enforces centrally, 08 F2).
       hash_request = [
         { role: 'user', content: 'hello' },
         { role: 'assistant', content: 'ssot stub response' }
       ]
 
-      expect { callable.chat(messages: hash_request, model: 'm/v1') }
+      expect { callable.chat(hash_request, model: 'm/v1') }
         .to raise_error(ArgumentError, /Canonical::Message/)
       expect { callable.count_tokens(messages: hash_request, model: 'm/v1') }
         .to raise_error(ArgumentError, /Canonical::Message/)
-
-      model = Legion::Extensions::Llm::Model::Info.new(id: 'm/v1', provider: :mlx)
-      expect do
-        callable.send(:provider).send(
-          :render_payload,
-          hash_request,
-          tools: {},
-          temperature: 0.2,
-          model: model,
-          stream: false,
-          schema: nil,
-          thinking: nil,
-          tool_prefs: nil
-        )
-      end.to raise_error(ArgumentError, /Canonical::Message/)
     end
+
+    # ─── 0.8.0 kit boundary groups (09 B1/B2, one oracle) ──────────────────
+
+    it_behaves_like 'B1 — central canonical enforcement (08 F2)'
+    it_behaves_like 'B2 — canonical outputs (05 O5, 08 R2)'
   end
 
   # --- OfferingDraft validation ------------------------------------------------

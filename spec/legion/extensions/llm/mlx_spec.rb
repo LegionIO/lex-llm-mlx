@@ -140,12 +140,13 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   end
 
   def chat_payload
-    # The provider-native lex-llm Message is the Chat-facade shape; the render
-    # seam accepts it (alongside Canonical::Message) and only rejects plain
-    # Hashes — so the wire payload is identical to the dispatch path.
-    message = Legion::Extensions::Llm::Message.new(role: :user, content: 'hello')
-    provider.send(:render_payload, [message], tools: {}, temperature: 0.2, model: model, stream: false,
-                                              schema: nil, thinking: nil, tool_prefs: nil)
+    # 0.8.0 renderer law (08 R1): render FROM canonical values — a
+    # Canonical::Message plus Canonical::Params (temperature is a params
+    # member, 05 O4) and the Selection-derived model string.
+    message = Legion::Extensions::Llm::Canonical::Message.build(role: :user, content: 'hello')
+    params = Legion::Extensions::Llm::Canonical::Params.build(temperature: 0.2)
+    provider.send(:render_payload, [message], tools: {}, model: model.id, stream: false,
+                                              schema: nil, thinking: nil, params: params, tool_prefs: nil)
   end
 
   def parsed_models

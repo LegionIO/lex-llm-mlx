@@ -31,6 +31,7 @@ require 'legion/extensions/llm/mlx'
 if Gem.loaded_specs['lex-llm']
   kit_path = File.join(Gem.loaded_specs['lex-llm'].full_gem_path, 'spec/legion/extensions/llm/conformance')
   require File.join(kit_path, 'ssot_provider_examples.rb')
+  require File.join(kit_path, 'ssot_contract_examples.rb')
 end
 
 if defined?(Legion::Settings)
