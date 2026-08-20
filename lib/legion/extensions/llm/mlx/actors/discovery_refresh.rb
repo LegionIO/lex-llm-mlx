@@ -16,7 +16,6 @@ unless defined?(Legion::Extensions::Actors::Every)
 end
 
 require 'legion/extensions/llm/inventory/publisher'
-require 'legion/extensions/llm/inventory/scoped_refresher'
 require 'legion/extensions/llm/inventory/identity'
 require 'legion/extensions/llm/inventory/records'
 require 'legion/extensions/llm/inventory/evidence'
@@ -803,12 +802,7 @@ module Legion
             private
 
             def publisher
-              @publisher ||= Legion::Extensions::Llm::Inventory::Publisher.new(
-                provider_family: :mlx,
-                compatibility_adapter: Legion::Extensions::Llm::Inventory::ScopedRefresher::LegacyCoordinatorAdapter.new(
-                  provider_family: :mlx
-                )
-              )
+              @publisher ||= Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
             end
 
             def claim_and_activate_instance(name:, instance_cfg:)
@@ -878,13 +872,16 @@ module Legion
           # plus the `disconnect` and `normalize_dispatch_error(error:)`
           # contracts required by Inventory::CallableHandle and
           # Routing::ProviderOutcome. Provider and Faraday errors are NOT
-          # rescued here so the coordinator's normalize_dispatch_error can
-          # classify them.
+          # rescued here so the dispatch normalizer can classify them.
+          # 0.8.0 callable contract: chat/stream_chat take the rehydrated
+          # message array positionally (WorkerExecution dispatch shape) and
+          # the Selection-derived model as a bare String.
           class MlxCallable
             # Keys the base Provider exposes as named kwargs for the
-            # completion operations. Anything else the fleet passes is folded
-            # into the payload `params` hash.
-            COMPLETION_NAMED_KEYS = %i[tools temperature schema thinking tool_prefs headers].freeze
+            # completion operations. Anything else the fleet passes (sampling
+            # scalars, `temperature` — a Canonical::Params member, 05 O4) is
+            # folded into Canonical::Params at the dispatch boundary.
+            COMPLETION_NAMED_KEYS = %i[tools schema thinking tool_prefs headers].freeze
             EMBED_NAMED_KEYS = %i[dimensions headers].freeze
 
             def initialize(instance_cfg:, logger:)
@@ -910,27 +907,27 @@ module Legion
 
             # ── Fleet dispatch operations ───────────────────────────────────
 
-            def chat(messages:, model:, **rest)
+            def chat(messages, model:, **rest)
               record_inference
               # Canonical boundary (N x N law): pipeline dispatch delivers
               # Canonical::Message objects only. Hash/legacy shapes are the
               # bypass class — reject loudly, never coerce.
               provider.enforce_canonical_messages!(messages)
               named, params = split_fleet_kwargs(rest, COMPLETION_NAMED_KEYS)
-              provider.chat(messages: messages, model: model_info(model), params: params, **named)
+              provider.chat(messages, model: model, params: canonical_params(params), **named)
             end
 
-            def stream_chat(messages:, model:, **rest, &)
+            def stream_chat(messages, model:, **rest, &)
               record_inference
               provider.enforce_canonical_messages!(messages)
               named, params = split_fleet_kwargs(rest, COMPLETION_NAMED_KEYS)
-              provider.stream_chat(messages: messages, model: model_info(model), params: params, **named, &)
+              provider.stream_chat(messages, model: model, params: canonical_params(params), **named, &)
             end
 
             def embed(text:, model:, **rest)
               record_inference
               named, params = split_fleet_kwargs(rest, EMBED_NAMED_KEYS)
-              provider.embed(text: text, model: model_info(model), params: params, **named)
+              provider.embed(text: text, model: model, params: params, **named)
             end
 
             def count_tokens(messages:, model:, **rest)
@@ -960,15 +957,12 @@ module Legion
               @provider ||= Legion::Extensions::Llm::Mlx::Provider.new(@instance_cfg)
             end
 
-            # The fleet passes the model as a bare string; the base Provider's
-            # payload renderer needs a Model::Info (model.id). Wrap strings
-            # only — pass through anything already carrying model identity.
-            def model_info(model)
-              return model if model.respond_to?(:id)
-
-              Legion::Extensions::Llm::Model::Info.new(
-                id: model.to_s, provider: Legion::Extensions::Llm::Mlx::PROVIDER_FAMILY
-              )
+            # The 0.8.0 completion funnel receives canonical values only
+            # (08 F3): the folded wire params become a Canonical::Params at
+            # the dispatch boundary — temperature is a params member (05 O4),
+            # never a kwarg.
+            def canonical_params(params)
+              Legion::Extensions::Llm::Canonical::Params.from_hash(params)
             end
 
             # Split the fleet's **rest into the base Provider's named kwargs
