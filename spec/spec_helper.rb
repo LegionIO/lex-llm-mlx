@@ -5,11 +5,40 @@ require 'logger'
 
 require 'legion/extensions/llm'
 
+# Functional stand-in for the LegionIO `Legion::Extensions::Helpers::Lex`
+# helper, for MLX specs. The shared base discovery actor
+# (lex-llm discovery/actor.rb) `include`s this host helper; in a standalone
+# provider spec env the gem's own spec_helper must supply it. Provides the REAL
+# settings/log/handle_exception the provider runner and actor rely on, without
+# loading the full LegionIO helper stack.
+#
+# The self-extend hook mirrors the real Lex so module-level runners
+# (Runners::Discovery) get settings/log/handle_exception on the module — the
+# pipeline is a mixed-in module that calls them at module level.
+require 'legion/logging'
+require 'legion/settings'
+
+module Legion
+  module Extensions
+    module Helpers
+      module Lex
+        include Legion::Logging::Helper
+        include Legion::Settings::Helper
+
+        def self.included(base)
+          base.extend(base) if base.instance_of?(Module) && !base.instance_of?(Class)
+        end
+      end
+    end
+  end
+end
+
 # Stub the actor base class before loading the MLX extension so that
-# discovery_refresh.rb defines its classes (which live inside the
-# `raise unless defined?(Legion::Extensions::Actors::Every)` guard).
-# The stub only satisfies the guard; specs drive the actor by calling
-# `manual`/`shutdown` directly and never start a timer.
+# discovery.rb's empty subclass of the shared base actor loads (it lives
+# inside the `return unless defined?(Legion::Extensions::Llm::Discovery::Actor)`
+# guard, which the stubbed `Every` satisfies). The thin actor redefines
+# nothing; specs drive the `Mlx::Runners::Discovery` module directly and never
+# start a timer.
 module Legion
   module Extensions
     module Actors

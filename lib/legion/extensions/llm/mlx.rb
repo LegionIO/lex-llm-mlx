@@ -3,7 +3,8 @@
 require 'legion/extensions/llm'
 require 'legion/extensions/llm/mlx/provider'
 require 'legion/extensions/llm/mlx/version'
-require 'legion/extensions/llm/mlx/actors/discovery_refresh'
+require 'legion/extensions/llm/mlx/helpers/callable'
+require 'legion/extensions/llm/mlx/actors/discovery'
 
 module Legion
   module Extensions
@@ -43,7 +44,15 @@ module Legion
         # operator-configured instances. No port-scanning, no fabricated
         # instances, no tier override.
         def self.discover_instances
-          configured_instances
+          configured_instances.reject do |_, normalized|
+            # enabled: false is a skip, not a claimable instance: the shared
+            # Discovery::Pipeline reads this method as the single claimable
+            # source and would otherwise claim + publish a disabled instance
+            # as a live lane (an operator's enabled: false is user-space
+            # intent). A credential-less instance (no api base to call) is
+            # equally non-claimable — same skip as the vLLM sibling.
+            normalized[:enabled] == false || normalized[:mlx_api_base].to_s.strip.empty?
+          end
         end
 
         # Only instances the operator actually configured are claimable.

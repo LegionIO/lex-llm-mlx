@@ -6,7 +6,8 @@ require 'legion/extensions/llm/inventory/registry'
 require 'legion/extensions/llm/inventory/identity'
 require 'legion/extensions/llm/inventory/probe_coordinator'
 require 'legion/extensions/llm/mlx/provider'
-require 'legion/extensions/llm/mlx/actors/discovery_refresh'
+require 'legion/extensions/llm/mlx/actors/discovery'
+require 'legion/extensions/llm/mlx/runners/discovery'
 
 RSpec.describe Legion::Extensions::Llm::Mlx::Provider do
   describe '0.8.0 funnel shape (08 F1/F3)' do
@@ -40,15 +41,14 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Provider do
 
     before do
       registry.reset!
-      draft = Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh.new.send(
-        :build_offering_draft,
+      draft = Legion::Extensions::Llm::Mlx::Runners::Discovery.build_offering_draft(
         model_id: model_id,
         model_data: { id: model_id, max_model_len: 32_768 },
         instance_cfg: { mlx_api_base: 'http://localhost:8000', tier: :local },
         instance_key: key
       )
       publisher = Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
-      callable = Legion::Extensions::Llm::Mlx::Actor::MlxCallable.new(
+      callable = Legion::Extensions::Llm::Mlx::Helpers::Callable.new(
         instance_cfg: { mlx_api_base: 'http://localhost:8000' }, logger: Logger.new(File::NULL)
       )
       token = publisher.claim_instance(

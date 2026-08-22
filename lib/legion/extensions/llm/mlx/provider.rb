@@ -113,13 +113,6 @@ module Legion
             log.info("Checking MLX readiness (live=#{live})")
             super
           end
-
-          def list_models(**)
-            log.info('Listing available MLX models')
-            models = super
-            log.info("Discovered #{Array(models).size} MLX models")
-            models
-          end
         end
       end
     end

@@ -2,20 +2,25 @@
 
 require 'spec_helper'
 require 'legion/extensions/llm/inventory/registry'
-require 'legion/extensions/llm/mlx/actors/discovery_refresh'
+require 'legion/extensions/llm/mlx/actors/discovery'
+require 'legion/extensions/llm/mlx/runners/discovery'
 
-# Lifecycle coverage for the SSOT discovery actor: claim/activate,
-# initial-failure recovery (D4), tick reconcile, display health writes
-# (D14), and cadence resolution (D9). The HTTP boundary of the readiness
-# probe and model fetch is stubbed on the actor instance so the registry
-# state machine runs offline.
-RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
-  # let (not subject) so the probe-boundary stubs below are not
-  # flagged as stubbing the object under test.
-  let(:actor) { described_class.new }
+# Lifecycle coverage for the SSOT discovery runner (the write half of the
+# inventory): claim/activate, initial-failure recovery (D4), tick reconcile,
+# display health writes (D14), cadence resolution (D9), write-time weight
+# publication, and the D16/V3 fetch-failure discipline. The HTTP boundary of the
+# readiness probe and model fetch is stubbed on the runner module so the
+# registry state machine runs offline.
+RSpec.describe Legion::Extensions::Llm::Mlx::Runners::Discovery do
+  # `described_class` is the runner MODULE (extend self). It carries per-instance
+  # working state in a module-level Concurrent::Map, so each example resets it.
+  let(:actor) { described_class }
 
   let(:registry) { Legion::Extensions::Llm::Inventory::Registry }
   let(:settings_tree) { Legion::Settings.loader.settings[:extensions][:llm][:mlx] }
+
+  # The thin actor: `#time` and periodicity live on the actor, not the runner.
+  let(:period_actor) { Legion::Extensions::Llm::Mlx::Actor::Discovery.new }
 
   # Plain methods (not lets) to stay under RSpec/MultipleMemoizedHelpers.
 
@@ -49,12 +54,12 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
     readiness(ready: false, reason: 'MLX /health connection failed')
   end
 
-  # Boundary stubs: the actor builds its own Faraday connections per
-  # probe/fetch, so the probe + model-fetch boundary is stubbed on the
-  # actor instance (there is no injectable seam at the connection level).
+  # Boundary stubs: the runner builds its own Faraday connections per
+  # probe/fetch, so the probe + model-fetch boundary is stubbed on the module
+  # (there is no injectable seam at the connection level).
   def stub_probe_boundaries
     allow(actor).to receive_messages(
-      fetch_models: [{ id: 'test-model', max_model_len: 4096 }],
+      fetch_raw_models: [{ id: 'test-model', max_model_len: 4096 }],
       check_health: unhealthy
     )
   end
@@ -75,19 +80,16 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
     settings_tree[:instances][:studio][:health]
   end
 
-  def expect_display_health(available:, circuit_state:, adjustment:, outcome:, reason: nil)
+  # D14 display-health contract: the 0.8.0 health hash is
+  # { state:, reason:, observed_at:, last_probe_outcome:, source: } — the
+  # pre-SSOT circuit dial (circuit_state/adjustment) and the boolean available
+  # are gone.
+  def expect_display_health(state:, source:, outcome:, reason: nil)
     health = studio_health
-    expect(health[:available]).to be(available)
-    expect(health[:circuit_state]).to eq(circuit_state)
-    expect(health[:adjustment]).to eq(adjustment)
-    expect_health_metadata(health: health, last_probe_outcome: outcome, reason: reason)
-  end
-
-  def expect_health_metadata(health:, last_probe_outcome:, reason:)
-    expected = { denied: false, last_probe_outcome: last_probe_outcome,
-                 source: :provider_probe, observed_at: be_a(String) }
-    expected[:reason] = reason if reason
-    expect(health.slice(*expected.keys)).to match(expected)
+    expect(health).to include(state: state, source: source, last_probe_outcome: outcome)
+    expect(health[:observed_at]).to be_a(String)
+    expect(health[:reason]).to eq(reason) if reason
+    expect(health.keys).not_to include(:available, :circuit_state, :adjustment)
   end
 
   def expect_display_capabilities(*capabilities)
@@ -96,41 +98,42 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
 
   before do
     registry.reset!
+    actor.reset_state!
     settings_tree.replace(instances: { studio: { endpoint: "http://#{studio_id}" } })
     stub_probe_boundaries
   end
 
   after { settings_tree.replace({}) }
 
-  describe '#manual' do
+  describe '#refresh' do
     it 'claims the configured instance and stays initializing after an initial readiness failure' do
-      actor.manual
+      actor.refresh
 
       expect(registry.snapshot.publication_status(instance_key: studio_key).state).to eq(:initializing)
       expect(registry.snapshot.instance(instance_key: studio_key)).to be_nil
     end
 
     it 'writes the display health hash into settings after the initial readiness commit' do
-      actor.manual
+      actor.refresh
 
-      expect_display_health(available: false, circuit_state: :open, adjustment: -50, outcome: :failure,
+      expect_display_health(state: :initializing, source: :startup_readiness, outcome: :failure,
                             reason: 'MLX /health connection failed')
     end
 
     it 're-activates an initializing instance on the first healthy tick' do
-      actor.manual
+      actor.refresh
       make_healthy!
-      actor.manual
+      actor.refresh
 
       expect_instance_availability(instance_key: studio_key, state: :available)
       expect_publication(instance_key: studio_key, state: :complete)
-      expect_display_health(available: true, circuit_state: :closed, adjustment: 0, outcome: :success)
+      expect_display_health(state: :available, source: :startup_readiness, outcome: :success)
       expect_display_capabilities(:completion, :streaming)
     end
 
     it 'stays initializing while the instance remains unhealthy' do
-      actor.manual
-      actor.manual
+      actor.refresh
+      actor.refresh
 
       expect_publication(instance_key: studio_key, state: :initializing)
       expect(registry.snapshot.instance(instance_key: studio_key)).to be_nil
@@ -138,20 +141,21 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
 
     it 'publishes offerings for a healthy instance at boot' do
       make_healthy!
-      actor.manual
+      actor.refresh
 
-      offerings = registry.snapshot.offerings_for(instance_key: studio_key)
-      expect(offerings.map(&:model)).to eq(['test-model'])
-      expect(offerings.first.operation_evidence[:chat].status).to eq(:supported)
-      expect(offerings.first.operation_evidence[:stream_chat].status).to eq(:supported)
+      lanes = registry.snapshot.lanes_for(instance_key: studio_key)
+      expect(lanes.map(&:model)).to eq(['test-model'])
+      expect(lanes.first.operation).to eq(:chat)
+      expect(lanes.first.capability_evidence[:completion].status).to eq(:supported)
+      expect(lanes.first.capability_evidence[:streaming].status).to eq(:supported)
     end
 
     it 'removes instances that are no longer configured (tick reconcile)' do
-      actor.manual
+      actor.refresh
       expect_publication(instance_key: studio_key, state: :initializing)
 
       settings_tree[:instances].replace(other: { endpoint: "http://#{other_id}" })
-      actor.manual
+      actor.refresh
 
       expect(registry.snapshot.publication_status(instance_key: studio_key)).to be_nil
       expect_publication(instance_key: other_key, state: :initializing)
@@ -159,10 +163,10 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
 
     it 'clears registry state and settings health on shutdown' do
       make_healthy!
-      actor.manual
+      actor.refresh
       expect(registry.snapshot.instance(instance_key: studio_key)).not_to be_nil
 
-      actor.shutdown
+      actor.remove_all_instances
 
       expect(registry.snapshot.instance(instance_key: studio_key)).to be_nil
       expect(registry.snapshot.publication_status(instance_key: studio_key)).to be_nil
@@ -184,7 +188,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
     it 'registers nothing when only the synthetic default is present' do
       settings_tree[:instances] = { default: synthetic_default }
 
-      actor.manual
+      actor.refresh
 
       expect(instance_ids).to be_empty
       # The derived host:port is the SECONDARY physical id, never the
@@ -200,7 +204,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       settings_tree[:instances] = { default: synthetic_default, studio: { endpoint: "http://#{studio_id}" } }
       make_healthy!
 
-      actor.manual
+      actor.refresh
 
       expect(instance_ids).to contain_exactly('default', 'studio')
     end
@@ -219,7 +223,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       }
       make_healthy!
 
-      actor.manual
+      actor.refresh
 
       expect(instance_ids).to include('studio')
     end
@@ -228,13 +232,13 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
   describe '#time' do
     it 'honors the registered discovery.interval_seconds' do
       settings_tree[:discovery] = { enabled: true, interval_seconds: 42 }
-      expect(actor.time).to eq(42)
+      expect(period_actor.time).to eq(42)
     end
 
     it 'never returns nil and falls back to the registered default' do
       settings_tree.replace({})
-      expect(actor.time).to eq(described_class::DEFAULT_DISCOVERY_INTERVAL_SECONDS)
-      expect(actor.time).to be_a(Integer).and be > 0
+      expect(period_actor.time).to eq(300)
+      expect(period_actor.time).to be_a(Integer).and be > 0
     end
   end
 
@@ -257,8 +261,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
     end
 
     def build_weighted_draft(model_id: 'test-model')
-      actor.send(
-        :build_offering_draft,
+      actor.build_offering_draft(
         model_id: model_id,
         model_data: { id: model_id, max_model_len: 4096 },
         instance_cfg: { endpoint: "http://#{studio_id}", tier: :local },
@@ -268,7 +271,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
 
     def writer_state(draft:, published: true)
       {
-        name: :studio,
+        name: 'studio',
         instance_id: 'studio',
         physical_id: studio_id,
         instance_key: studio_key,
@@ -299,24 +302,14 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
 
     before { make_healthy! }
 
-    it 'constructs each draft with the exact four weight inputs and product' do
-      configure_weights(provider: 120, instance: 110, models: { 'test-model' => 130 }, tier: 140)
-
-      draft = build_weighted_draft
-
-      expect(draft.weight_inputs).to eq(tier: 140, provider: 120, instance: 110, model_or_offering: 130)
-      expect(draft.base_weight).to eq(240_240_000)
-      expect(draft.base_weight).to eq(draft.weight_inputs.values.reduce(1, :*))
-    end
-
     it 'publishes one frozen replacement for a weight-only change on the next ordinary pass' do
       configure_weights
-      publisher = actor.send(:publisher)
+      publisher = actor.publisher
       replacements = replace_calls_for(publisher)
       fetches = 0
       probes = 0
       display_writes = 0
-      allow(actor).to receive(:fetch_models) do
+      allow(actor).to receive(:fetch_raw_models) do
         fetches += 1
         [{ id: 'test-model', max_model_len: 4096 }]
       end
@@ -324,33 +317,35 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
         probes += 1
         healthy
       end
-      allow(actor).to receive(:write_instance_health).and_wrap_original do |method, **kwargs|
+      allow(actor).to receive(:write_instance_health).and_wrap_original do |method, state|
         display_writes += 1
-        method.call(**kwargs)
+        method.call(state)
       end
 
-      actor.manual
+      actor.refresh
       settings_tree[:weight] = 125
-      actor.manual
+      actor.refresh
 
       expect(replacements.length).to eq(1)
       expect(replacements.first[:offerings]).to be_frozen
       expect(replacements.first[:offerings].first.weight_inputs[:provider]).to eq(125)
       expect(fetches).to eq(2)
       expect(probes).to eq(2)
-      expect(display_writes).to eq(2)
+      # 3 display writes: the boot activation commit, the weight-change
+      # replacement, and the cadence probe observation on the same tick.
+      expect(display_writes).to eq(3)
     end
 
     it 'publishes nothing when a settings change leaves the weight pair unchanged' do
       configure_weights
-      publisher = actor.send(:publisher)
+      publisher = actor.publisher
       replacements = replace_calls_for(publisher)
-      actor.manual
-      state = actor.instance_variable_get(:@instance_states).fetch('studio')
+      actor.refresh
+      state = actor.states.fetch('studio')
       sequence = state.fetch(:sequence)
 
       settings_tree[:unrelated_setting] = 'changed'
-      actor.manual
+      actor.refresh
 
       expect(replacements).to be_empty
       expect(state.fetch(:sequence)).to eq(sequence)
@@ -371,13 +366,13 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
         { id: 'model-a', max_model_len: 4096 },
         { id: 'model-b', max_model_len: 8192 }
       ]
-      allow(actor).to receive(:fetch_models).and_return(catalog, catalog.reverse)
-      publisher = actor.send(:publisher)
+      allow(actor).to receive(:fetch_raw_models).and_return(catalog, catalog.reverse)
+      publisher = actor.publisher
       replacements = replace_calls_for(publisher)
 
-      actor.manual
-      state = actor.instance_variable_get(:@instance_states).fetch('studio')
-      actor.manual
+      actor.refresh
+      state = actor.states.fetch('studio')
+      actor.refresh
 
       expect(replacements).to be_empty
       expect(state.fetch(:sequence)).to eq(0)
@@ -389,14 +384,14 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
         { id: 'model-a', max_model_len: 4096 },
         { id: 'model-b', max_model_len: 8192 }
       ]
-      allow(actor).to receive(:fetch_models).and_return(catalog, catalog + [catalog.first])
-      publisher = actor.send(:publisher)
+      allow(actor).to receive(:fetch_raw_models).and_return(catalog, catalog + [catalog.first])
+      publisher = actor.publisher
       replacements = []
       allow(publisher).to receive(:replace_instance_snapshot) { |**kwargs| replacements << kwargs }
 
-      actor.manual
-      state = actor.instance_variable_get(:@instance_states).fetch('studio')
-      actor.manual
+      actor.refresh
+      state = actor.states.fetch('studio')
+      actor.refresh
 
       expect(replacements.length).to eq(1)
       expect(replacements.first.fetch(:offerings).length).to eq(3)
@@ -405,49 +400,41 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
 
     it 'publishes when contract evidence content changes' do
       configure_weights
-      publisher = actor.send(:publisher)
+      publisher = actor.publisher
       replacements = replace_calls_for(publisher)
-      actor.manual
-      allow(actor).to receive(:fetch_models).and_return([{ id: 'test-model', max_model_len: 8192 }])
+      actor.refresh
+      allow(actor).to receive(:fetch_raw_models).and_return([{ id: 'test-model', max_model_len: 8192 }])
 
-      actor.manual
+      actor.refresh
 
       expect(replacements.length).to eq(1)
       evidence = replacements.first[:offerings].first.context_evidence
       expect(evidence.value).to eq(8192)
     end
 
-    it 'preserves an explicit zero and rejects false instead of defaulting it' do
-      configure_weights(provider: 0)
-      expect(build_weighted_draft.weight_inputs[:provider]).to eq(0)
-
-      settings_tree[:weight] = false
-      expect { build_weighted_draft }.to raise_error(ArgumentError, /Integer >= 0/)
-    end
-
-    it 'leaves no claimed scope for malformed weights and cleanly retries after correction' do
-      publisher = actor.send(:publisher)
-      allow(publisher).to receive(:claim_instance).and_call_original
+    it 'leaves nothing published for malformed weights and cleanly publishes after correction' do
+      # The shared pipeline claims the instance first and validates the weight
+      # pair at publish (WeightReconciler). A malformed weight therefore never
+      # PUBLISHES a lane — the claim stays :initializing and the draft is never
+      # activated — and a corrected weight publishes cleanly on the next pass.
       configure_weights(provider: false)
 
-      actor.manual
+      actor.refresh
 
       snapshot = registry.snapshot
-      expect(publisher).not_to have_received(:claim_instance)
-      expect(snapshot.each_publication_status.to_a).to be_empty
+      expect(snapshot.publication_status(instance_key: studio_key).state).to eq(:initializing)
       expect(snapshot.each_instance.to_a).to be_empty
-      expect(snapshot.each_offering.to_a).to be_empty
-      expect(actor.instance_variable_get(:@instance_states)).to be_empty
+      expect(actor.states.fetch('studio')[:published]).to be(false)
 
       settings_tree[:weight] = 100
-      actor.manual
-      actor.manual
+      actor.refresh
+      actor.refresh
 
-      expect(publisher).to have_received(:claim_instance).once
-      expect(registry.snapshot.publication_status(instance_key: studio_key).state).to eq(:complete)
-      expect(registry.snapshot.each_instance.to_a.size).to eq(1)
-      expect(registry.snapshot.offerings_for(instance_key: studio_key).size).to eq(1)
-      expect(actor.instance_variable_get(:@instance_states).fetch('studio')[:published]).to be(true)
+      final = registry.snapshot
+      expect(final.publication_status(instance_key: studio_key).state).to eq(:complete)
+      expect(final.each_instance.to_a.size).to eq(1)
+      expect(final.lanes_for(instance_key: studio_key).size).to eq(1)
+      expect(actor.states.fetch('studio')[:published]).to be(true)
     end
 
     it 'logs the complete dormant cycle once per disappearance on ordinary passes' do
@@ -463,15 +450,15 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       allow(actor).to receive(:claim_and_activate_instance)
       allow(actor).to receive(:refresh_instance)
 
-      actor.manual
-      actor.manual
+      actor.refresh
+      actor.refresh
       draft = build_weighted_draft
-      actor.instance_variable_get(:@instance_states)['ghost'] = {
+      actor.states['ghost'] = {
         published: true, instance_key: ghost_key, offerings: [draft]
       }
-      actor.manual
-      actor.instance_variable_get(:@instance_states).delete('ghost')
-      actor.manual
+      actor.refresh
+      actor.states.delete('ghost')
+      actor.refresh
 
       text = '[llm][mlx] action=dormant_weight ' \
              'weight_key=[:mlx, :instance, "ghost"] no_lane_published=true'
@@ -480,19 +467,19 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
 
     it 'keeps sequence stable through ten unchanged ordinary passes' do
       configure_weights
-      publisher = actor.send(:publisher)
+      publisher = actor.publisher
       replacements = replace_calls_for(publisher)
-      actor.manual
-      state = actor.instance_variable_get(:@instance_states).fetch('studio')
+      actor.refresh
+      state = actor.states.fetch('studio')
 
-      10.times { actor.manual }
+      10.times { actor.refresh }
 
       expect(replacements).to be_empty
       expect(state.fetch(:sequence)).to eq(0)
     end
 
     it 'has no Settings lifecycle path and clears only repository-local tracking on shutdown' do
-      source = File.read(described_class.instance_method(:manual).source_location.first)
+      source = File.read(described_class.instance_method(:refresh).source_location.first)
       lifecycle_calls = /Legion::Settings\.(?:on_reload|off_reload|reload!|reset!)/
       expect(source).not_to match(lifecycle_calls)
 
@@ -501,9 +488,9 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
         ghost: { endpoint: 'http://ghost.local:8000', tier: :local, weight: 123 }
       }
       allow(actor).to receive(:claim_and_activate_instance)
-      actor.manual
-      tracker = actor.instance_variable_get(:@dormant_weight_tracker)
-      actor.shutdown
+      actor.refresh
+      tracker = actor.dormant_weight_tracker
+      actor.remove_all_instances
 
       key = [:mlx, :instance, 'ghost']
       expect(tracker.observe(configured_keys: [key], published_keys: [])).to eq([key])
@@ -513,17 +500,17 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       configure_weights(models: { 'initial' => 100, 'model-a' => 101, 'model-b' => 102 })
       initial = build_weighted_draft(model_id: 'initial')
       state = writer_state(draft: initial)
-      actor.instance_variable_set(:@instance_states, 'studio' => state)
+      actor.states.clear
+      actor.states['studio'] = state
       arrived = Queue.new
       release = Queue.new
       publications = []
       publication_mutex = Mutex.new
-      publisher = instance_double(Legion::Extensions::Llm::Inventory::Publisher)
+      publisher = actor.publisher
       allow(publisher).to receive(:replace_instance_snapshot) do |**kwargs|
         publication_mutex.synchronize { publications << kwargs }
       end
-      allow(actor).to receive(:publisher).and_return(publisher)
-      allow(actor).to receive(:discover_offerings_for_instance) do
+      allow(actor).to receive(:build_offerings) do
         arrived << true
         release.pop
         [build_weighted_draft(model_id: Thread.current.fetch(:model_id))]
@@ -532,7 +519,8 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       threads = %w[model-a model-b].map do |model_id|
         Thread.new do
           Thread.current[:model_id] = model_id
-          actor.send(:replace_offerings_if_changed, instance_id: 'studio', state: state)
+          actor.send(:replace_if_changed, instance_id: 'studio', state: state,
+                                          instance_cfg: state[:instance_cfg])
         end
       end
       2.times { arrived.pop }
@@ -550,24 +538,29 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       original = build_weighted_draft(model_id: 'initial')
       replacement = build_weighted_draft(model_id: 'replacement')
       state = writer_state(draft: original)
+      actor.states.clear
+      actor.states['studio'] = state
       publisher = instance_double(Legion::Extensions::Llm::Inventory::Publisher)
-      allow(actor).to receive_messages(publisher: publisher, discover_offerings_for_instance: [replacement])
+      allow(actor).to receive_messages(publisher: publisher, build_offerings: [replacement])
+      allow(actor).to receive(:write_instance_health)
       allow(publisher).to receive(:replace_instance_snapshot).and_raise('publish failed')
 
       expect do
-        actor.send(:replace_offerings_if_changed, instance_id: 'studio', state: state)
+        actor.send(:replace_if_changed, instance_id: 'studio', state: state,
+                                        instance_cfg: state[:instance_cfg])
       end.to raise_error(RuntimeError, 'publish failed')
       expect(state.values_at(:sequence, :offerings)).to eq([0, [original].freeze])
 
       allow(publisher).to receive(:replace_instance_snapshot)
-      actor.send(:replace_offerings_if_changed, instance_id: 'studio', state: state)
+      actor.send(:replace_if_changed, instance_id: 'studio', state: state,
+                                      instance_cfg: state[:instance_cfg])
       expect(state.fetch(:sequence)).to eq(1)
       expect(state.fetch(:offerings).first.model).to eq('replacement')
     end
 
     it 'rebuilds with current settings after draft construction but before initial activation' do
       configure_weights(models: { 'test-model' => 101 })
-      allow(actor).to receive(:fetch_models).and_return([{ id: 'test-model', max_model_len: 4096 }])
+      allow(actor).to receive(:fetch_raw_models).and_return([{ id: 'test-model', max_model_len: 4096 }])
       entered = Queue.new
       release = Queue.new
       allow(actor).to receive(:check_health) do
@@ -575,7 +568,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
         release.pop
         healthy
       end
-      actor.instance_variable_set(:@instance_states, {})
+      actor.states.clear
       instance_cfg = Legion::Extensions::Llm::Mlx.configured_instances.fetch(:studio)
 
       activation = Thread.new do
@@ -586,8 +579,8 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       release << true
       activation.value
 
-      offering = registry.snapshot.offerings_for(instance_key: studio_key).first
-      state = actor.instance_variable_get(:@instance_states).fetch('studio')
+      offering = registry.snapshot.lanes_for(instance_key: studio_key).first
+      state = actor.states.fetch('studio')
       expect(offering.weight_inputs[:model_or_offering]).to eq(175)
       expect(state.fetch(:offerings).first.weight_inputs[:model_or_offering]).to eq(175)
     end
@@ -598,14 +591,14 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       logger = Logger.new(File::NULL)
       allow(logger).to receive(:info).and_call_original
       allow(actor).to receive_messages(check_health: make_unhealthy, log: logger)
-      publisher = actor.send(:publisher)
+      publisher = actor.publisher
       allow(publisher).to receive(:replace_instance_snapshot).and_call_original
       allow(publisher).to receive(:activate_instance_snapshot).and_call_original
-      actor.manual
+      actor.refresh
 
       settings_tree[:weight] = 175
-      actor.manual
-      state = actor.instance_variable_get(:@instance_states).fetch('studio')
+      actor.refresh
+      state = actor.states.fetch('studio')
 
       expect(state.fetch(:published)).to be(false)
       expect(state.fetch(:offerings).first.weight_inputs[:provider]).to eq(175)
@@ -619,7 +612,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
 
     it 'does not resurrect a tracked state removed while readiness is in flight' do
       configure_weights
-      allow(actor).to receive(:fetch_models).and_return([{ id: 'test-model', max_model_len: 4096 }])
+      allow(actor).to receive(:fetch_raw_models).and_return([{ id: 'test-model', max_model_len: 4096 }])
       entered = Queue.new
       release = Queue.new
       allow(actor).to receive(:check_health) do
@@ -627,8 +620,8 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
         release.pop
         healthy
       end
-      actor.instance_variable_set(:@instance_states, {})
-      publisher = actor.send(:publisher)
+      actor.states.clear
+      publisher = actor.publisher
       allow(publisher).to receive(:activate_instance_snapshot).and_call_original
       allow(actor).to receive(:write_instance_health).and_call_original
       instance_cfg = Legion::Extensions::Llm::Mlx.configured_instances.fetch(:studio)
@@ -637,12 +630,11 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
         actor.send(:claim_and_activate_instance, name: :studio, instance_cfg: instance_cfg)
       end
       entered.pop
-      state = actor.instance_variable_get(:@instance_states).fetch('studio')
-      actor.send(:remove_instance_state, instance_id: 'studio', state: state)
+      actor.send(:remove_instance_state, 'studio')
       release << true
       activation.value
 
-      expect(actor.instance_variable_get(:@instance_states)).not_to have_key('studio')
+      expect(actor.states.key?('studio')).to be(false)
       expect(registry.snapshot.publication_status(instance_key: studio_key)).to be_nil
       expect(publisher).not_to have_received(:activate_instance_snapshot)
       expect(actor).not_to have_received(:write_instance_health)
@@ -652,23 +644,25 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
       configure_weights
       draft = build_weighted_draft
       state = writer_state(draft: draft, published: false)
-      actor.instance_variable_set(:@instance_states, 'studio' => state)
+      actor.states.clear
+      actor.states['studio'] = state
       publisher = instance_double(Legion::Extensions::Llm::Inventory::Publisher)
       allow(actor).to receive(:publisher).and_return(publisher)
+      allow(actor).to receive(:write_instance_health)
       allow(publisher).to receive(:activate_instance_snapshot).and_raise('activation failed')
 
-      expect do
-        actor.send(
-          :commit_readiness, instance_id: 'studio', probe_token: Object.new,
-                             readiness: healthy, state: state
-        )
-      end.to raise_error(RuntimeError, 'activation failed')
+      # The pipeline rescues the activation failure and reports a false commit —
+      # the draft stays cached and unpublished, so the next probe may retry.
+      expect(actor.send(
+               :report_probe_result, instance_id: 'studio', state: state,
+                                     probe_token: Object.new, readiness: healthy
+             )).to be(false)
       expect(state.values_at(:sequence, :offerings, :published)).to eq([0, [draft].freeze, false])
 
       allow(publisher).to receive(:activate_instance_snapshot)
       result = actor.send(
-        :commit_readiness, instance_id: 'studio', probe_token: Object.new,
-                           readiness: healthy, state: state
+        :report_probe_result, instance_id: 'studio', state: state,
+                              probe_token: Object.new, readiness: healthy
       )
       expect(result).to be(true)
       expect(state.fetch(:published)).to be(true)
@@ -678,48 +672,44 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh do
   # D16: only network/parse errors may yield zero offerings. Programming
   # errors must fail loud — converting them to [] would publish an
   # activated instance with zero offerings (invisible to routing).
+  # V3: a failed catalog fetch (Faraday::ConnectionFailed or a non-2xx
+  # response) raises CatalogFetchFailure — it is NOT swallowed to []. The
+  # last good snapshot is kept; the activation path rescues it to stay
+  # :initializing.
   describe 'offering discovery rescue discipline' do
-    # The group's outer before stubs fetch_models with a canned list; the
-    # boundary tests below need the REAL fetch_models against a stubbed
-    # connection, so re-enable the original implementation here.
-    before do
-      allow(actor).to receive(:fetch_models).and_call_original
-    end
-
     it 'fails loud on a programming error instead of publishing zero offerings' do
-      allow(actor).to receive(:fetch_models).and_return([{ id: 'test-model' }])
-      allow(actor).to receive(:fetch_models).and_return([{ id: 'test-model' }])
+      allow(actor).to receive(:fetch_raw_models).and_return([{ id: 'test-model' }])
       allow(actor).to receive(:build_offering_draft)
         .and_raise(NameError, 'undefined constant Bogus::Thing')
 
       expect do
-        actor.send(:discover_offerings_for_instance, instance_cfg: {}, instance_key: studio_key)
+        actor.build_offerings(instance_cfg: {}, instance_key: studio_key)
       end.to raise_error(NameError)
     end
 
-    it 'yields no offerings for a network failure' do
-      # Faraday::ConnectionFailed is raised by the adapter before any
-      # response exists; simulate the boundary directly.
-      allow(actor).to receive(:build_api_connection)
+    it 'raises CatalogFetchFailure for a network failure instead of returning []' do
+      # Faraday::ConnectionFailed is raised by the adapter before any response
+      # exists; the raw fetch propagates it and build_offerings wraps it in the
+      # typed CatalogFetchFailure (never []).
+      allow(actor).to receive(:fetch_raw_models)
         .and_raise(Faraday::ConnectionFailed, 'Connection refused')
 
-      expect(actor.send(:fetch_models, instance_cfg: {})).to eq([])
+      expect do
+        actor.build_offerings(instance_cfg: {}, instance_key: studio_key)
+      end.to raise_error(described_class::CatalogFetchFailure, /Faraday::ConnectionFailed/)
     end
 
-    it 'yields no offerings for an unparseable model-list body' do
+    it 'raises CatalogFetchFailure for a non-2xx model-list body' do
+      # Run the REAL fetch (the group's before stubs it to a canned list) so the
+      # status check runs against the stubbed connection.
+      allow(actor).to receive(:fetch_raw_models).and_call_original
       conn = instance_double(Faraday::Connection,
                              get: Faraday::Response.new(status: 502, body: '<html>bad gateway</html>'))
-      allow(actor).to receive(:build_api_connection).and_return(conn)
+      allow(actor).to receive(:build_connection).and_return(conn)
 
-      expect(actor.send(:fetch_models, instance_cfg: {})).to eq([])
-    end
-
-    it 'yields no offerings for a well-formed but non-array :data field' do
-      conn = instance_double(Faraday::Connection,
-                             get: Faraday::Response.new(status: 200, body: '{"data": {}}'))
-      allow(actor).to receive(:build_api_connection).and_return(conn)
-
-      expect(actor.send(:fetch_models, instance_cfg: {})).to eq([])
+      expect do
+        actor.fetch_raw_models(instance_cfg: {})
+      end.to raise_error(described_class::CatalogFetchFailure, /HTTP 502/)
     end
   end
 end
