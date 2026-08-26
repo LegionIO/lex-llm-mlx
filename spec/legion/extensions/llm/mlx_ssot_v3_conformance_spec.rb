@@ -189,11 +189,9 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     # The production callable dispatches through a real per-instance
     # Mlx::Provider built lazily from the instance config; the only seam
     # to run the dispatch ops offline is the shared HTTP boundary.
-    # rubocop:disable RSpec/AnyInstance -- the per-callable Provider is built lazily; the shared connection is the only offline seam
-    allow_any_instance_of(Legion::Extensions::Llm::Connection).to receive(:post) do |*_args|
+    allow_any_instance_of(Legion::Extensions::Llm::Connection).to receive(:post) do |*_args| # rubocop:disable RSpec/AnyInstance
       ssot_harness.stub_completion_response
     end
-    # rubocop:enable RSpec/AnyInstance
   end
 
   it_behaves_like 'an SSOT v3 provider adapter'
