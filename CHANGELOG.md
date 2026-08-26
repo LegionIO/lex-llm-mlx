@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.5.4] - 2026-08-20
+
+### Changed
+- **lex-llm 0.8.0 conformance.** Legacy type usage migrates to Canonical; the legacy coordinator wiring is removed; the gemspec floor is `lex-llm >= 0.8.0`.
+- Enforce the canonical dispatch boundary end to end: the `MlxCallable` dispatch operations (chat, stream_chat, count_tokens) call the shared `Provider#enforce_canonical_messages!` helper at the exact-execution boundary (12/O05) before delegating. Plain-Hash input raises a typed `ArgumentError` on every dispatch operation; the lenient hash re-canonicalization that masked the 2026-08-19 hash-bypass defect for 25 failed openai dispatches is gone.
+- Migrate the `MlxCallable` dispatch contract to the 0.8.0 callable shape: `chat`/`stream_chat` take the rehydrated `Array<Canonical::Message>` positionally (the `Fleet::WorkerExecution` dispatch shape and the kit B1/B2 callable contract), the Selection-derived model passes through as a bare String (the 0.8.0 renderer puts `model` on the wire as-is), and the folded wire params become a `Canonical::Params` at the dispatch boundary — `temperature` is a params member (05 O4) and no longer a named kwarg.
+- Migrate the offering call site to the writer path: the legacy read-path production (`offering_from_model` → `Routing::ModelOffering`, deleted from lex-llm 0.8.0) is removed; the base `discover_offerings` now serves the activated inventory offerings published by the discovery actor from the Registry snapshot (07 C5 / 08 D3).
+- Remove the discovery actor's `Inventory::ScopedRefresher::LegacyCoordinatorAdapter` compatibility wiring (the adapter is deleted in the lex-llm 0.8.0 cut; the `Publisher` is constructed registry-only).
+- Raise the `lex-llm` dependency floor to 0.8.0 for the canonical-only funnel, the Registry read path, fleet v3 exact execution, and the conformance kit.
+
+### Removed
+- `Provider#offering_from_model` with its offering-kwarg and capability-policy resolution helpers, and the `CapabilityConfig`/`CapabilityResolution` modules that fed only that read path. Config-cascade capability overrides (provider/instance/model `*_flag` keys) no longer have an MLX consumer: the SSOT evidence model treats config sources as unknown-only (`Taxonomies::UNKNOWN_ONLY_EVIDENCE_SOURCES`).
+- The provider-local `render_payload` message-boundary check — the 0.8.0 base funnel enforces `Canonical::Message` input centrally before rendering (08 F2); providers no longer re-implement the check, and the reference to the deleted legacy `Llm::Message` class is gone.
+- `MlxCallable#model_info` — the `Model::Info` wrapping was a 0.7.7 `model.id` renderer artifact; the 0.8.0 renderer renders the model string as-is.
+- `spec/legion/extensions/llm/mlx/provider_capability_policy_spec.rb` — it tested the removed offering-production path.
+
+### Added
+- The ssot_v3 conformance spec runs the 0.8.0 kit boundary groups B1 (central canonical enforcement) and B2 (canonical outputs asserted by type) against the real `MlxCallable`, alongside the existing SSOT v3 provider-adapter group.
+- `provider_contract_spec` rewritten against the 0.8.0 funnel shape (positional completion messages, named `text`/`prompt`) and the Registry-snapshot read path.
+- RULES.md (the 0.8.0 architecture law, byte-for-byte mirror of the lex-llm 0.8.0 release).
+- A local-tree `lex-llm` path dependency in the test group so the adjacent checkout resolves against the 0.8.0 cut during development.
+
 ## [0.5.3] - 2026-08-19
 
 ### Changed

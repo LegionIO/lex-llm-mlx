@@ -34,8 +34,6 @@ module Legion
               Legion::Extensions::Llm::Fleet::ProviderResponder.call(
                 payload: message,
                 provider_family: Mlx::PROVIDER_FAMILY,
-                provider_class: Mlx::Provider,
-                provider_instances: -> { Mlx.discover_instances },
                 registry: Legion::Extensions::Llm::Inventory::Registry,
                 delivery: nil,
                 properties: nil

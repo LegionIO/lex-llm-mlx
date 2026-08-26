@@ -28,7 +28,9 @@ Gem::Specification.new do |spec|
   spec.add_dependency 'legion-logging', '>= 1.3.2'
   spec.add_dependency 'legion-settings', '>= 1.4.2'
   spec.add_dependency 'legion-transport', '>= 1.4.14'
-  # 0.7.6 carries the write-time weight schema/reconciler and the immutable
-  # OfferingDraft/OfferingRecord/LaneRecord weight pair used by this writer.
-  spec.add_dependency 'lex-llm', '>= 0.7.6'
+  # 0.8.0 is the complete contract cut: the canonical-only funnel
+  # (positional completion messages, Canonical::Params at the render boundary),
+  # the Registry-snapshot read path, fleet v3 exact execution, and the
+  # conformance kit the ssot_v3 conformance spec runs.
+  spec.add_dependency 'lex-llm', '>= 0.8.0'
 end

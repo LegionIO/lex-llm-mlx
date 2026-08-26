@@ -8,8 +8,6 @@ RSpec.describe Legion::Extensions::Llm::Mlx::Runners::FleetWorker do
   let(:payload) { { request_id: 'req-1', provider: 'mlx', provider_instance: 'local', operation: 'chat' } }
 
   before do
-    allow(Legion::Extensions::Llm::Mlx).to receive(:discover_instances)
-      .and_return(local: { fleet: { respond_to_requests: true } })
     allow(Legion::Extensions::Llm::Fleet::ProviderResponder).to receive(:call).and_return(:ok)
   end
 

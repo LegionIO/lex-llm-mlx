@@ -2,10 +2,12 @@
 
 require 'spec_helper'
 require 'legion/extensions/llm/fleet/provider_responder'
+require 'legion/extensions/llm/inventory/identity'
+require 'legion/extensions/llm/mlx/runners/discovery'
 
 RSpec.describe Legion::Extensions::Llm::Mlx do
   let(:provider) { described_class::Provider.new(Legion::Extensions::Llm.config) }
-  let(:model) { Legion::Extensions::Llm::Model::Info.new(id: 'mlx-community/Qwen3-14B-4bit', provider: :mlx) }
+  let(:model) { 'mlx-community/Qwen3-14B-4bit' }
 
   it 'exposes provider defaults through the shared provider settings shape' do
     settings = described_class.default_settings
@@ -54,11 +56,29 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     Legion::Extensions::Llm.config.mlx_api_key = original
   end
 
-  it 'maps discovered chat and embedding models to explicit routing metadata' do
-    normalized = parsed_models.map { |parsed_model| Legion::Extensions::Llm::Capabilities.normalize(parsed_model.capabilities) }
+  # 0.8.0: model → operation knowledge is published by the discovery runner's
+  # build_offering_draft (operation_evidence), not a provider-side catalog
+  # parser. The chat-vs-embeddings routing fact is asserted at that owner.
+  it 'maps discovered chat and embedding models to explicit operation evidence' do
+    instance_key = Legion::Extensions::Llm::Inventory::Identity::InstanceKey.new(
+      provider_family: :mlx, instance_id: 'default'
+    )
+    cfg = { mlx_api_base: 'http://localhost:8000', tier: :local }
+    chat_draft = described_class::Runners::Discovery.build_offering_draft(
+      instance_cfg: cfg, instance_key: instance_key,
+      model_id: 'mlx-community/Qwen3-14B-4bit',
+      model_data: { id: 'mlx-community/Qwen3-14B-4bit', max_model_len: 32_768 }
+    )
+    embed_draft = described_class::Runners::Discovery.build_offering_draft(
+      instance_cfg: cfg, instance_key: instance_key,
+      model_id: 'mlx-community/nomic-embed-text',
+      model_data: { id: 'mlx-community/nomic-embed-text', max_model_len: 512 }
+    )
 
-    expect(normalized).to eq([%i[streaming tools], %i[embedding]])
-    expect(parsed_models.map { |model| model.modalities.to_h }).to eq(expected_modalities)
+    expect(chat_draft.operation_evidence[:chat].status).to eq(:supported)
+    expect(chat_draft.operation_evidence[:embed].status).to eq(:unsupported)
+    expect(embed_draft.operation_evidence[:embed].status).to eq(:supported)
+    expect(embed_draft.operation_evidence[:chat].status).to eq(:unsupported)
   end
 
   describe '.discover_instances' do
@@ -113,6 +133,23 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       expect(instances[:gpu1]).to include(mlx_api_base: 'http://gpu1:8080', tier: :local)
     end
 
+    it 'never claims a disabled (enabled: false) instance' do
+      settings_tree.replace(instances: {
+                              gpu1: { base_url: 'http://gpu1:8080' },
+                              gpu2: { base_url: 'http://gpu2:8080', enabled: false }
+                            })
+
+      instances = described_class.discover_instances
+      expect(instances).to have_key(:gpu1)
+      expect(instances).not_to have_key(:gpu2)
+    end
+
+    it 'never claims a credential-less instance with no api base' do
+      settings_tree.replace(instances: { gpu1: { tier: :local } })
+
+      expect(described_class.discover_instances).to eq({})
+    end
+
     it 'removes base_url key after normalization' do
       settings_tree.replace(instances: { gpu1: { base_url: 'http://gpu1:8080' } })
       instances = described_class.discover_instances
@@ -140,33 +177,12 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   end
 
   def chat_payload
-    message = Legion::Extensions::Llm::Message.new(role: :user, content: 'hello')
-    provider.send(:render_payload, [message], tools: {}, temperature: 0.2, model: model, stream: false,
-                                              schema: nil, thinking: nil, tool_prefs: nil)
-  end
-
-  def parsed_models
-    provider.send(:parse_list_models_response, fake_response(models_body), :mlx,
-                  described_class::Provider.capabilities)
-  end
-
-  def expected_modalities
-    [
-      { input: %w[text image], output: %w[text] },
-      { input: %w[text], output: %w[embeddings] }
-    ]
-  end
-
-  def models_body
-    {
-      'data' => [
-        { 'id' => 'mlx-community/Qwen3-14B-4bit', 'created' => 1 },
-        { 'id' => 'mlx-community/nomic-embed-text', 'created' => 2 }
-      ]
-    }
-  end
-
-  def fake_response(body)
-    Struct.new(:body).new(body)
+    # 0.8.0 renderer law (08 R1): render FROM canonical values — a
+    # Canonical::Message plus Canonical::Params (temperature is a params
+    # member, 05 O4) and the Selection-derived model string.
+    message = Legion::Extensions::Llm::Canonical::Message.build(role: :user, content: 'hello')
+    params = Legion::Extensions::Llm::Canonical::Params.build(temperature: 0.2)
+    provider.send(:render_payload, [message], tools: {}, model: model, stream: false,
+                                              schema: nil, thinking: nil, params: params, tool_prefs: nil)
   end
 end

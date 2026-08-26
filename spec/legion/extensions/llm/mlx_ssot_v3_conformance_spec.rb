@@ -16,7 +16,8 @@ require 'legion/extensions/llm/capabilities'
 require 'legion/extensions/llm/fleet/worker_execution'
 require 'legion/extensions/llm/fleet/protocol'
 
-require 'legion/extensions/llm/mlx/actors/discovery_refresh'
+require 'legion/extensions/llm/mlx/actors/discovery'
+require 'legion/extensions/llm/mlx/runners/discovery'
 
 # Synthetic error that represents a genuine explicit instance-unavailable
 # signal from an MLX process (e.g. graceful shutdown sentinel). Used only
@@ -48,7 +49,7 @@ STUB_COMPLETION_BODY = {
 # DELEGATE to the production actor's real methods — no harness-side
 # copies of the builders (D16).
 class MlxSsotHarness
-  ACTOR = Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh
+  ACTOR = Legion::Extensions::Llm::Mlx::Runners::Discovery
 
   # The operator's config names — the identity (InstanceKey.instance_id)
   # the discovery actor claims in tick_refresh (configured_instances
@@ -81,7 +82,7 @@ class MlxSsotHarness
   # production actor's derive_physical_id — dedup/diagnostics only,
   # never identity.
   def physical_id(instance_config:)
-    ACTOR.new.send(:derive_physical_id, instance_cfg: instance_config)
+    ACTOR.derive_physical_id(instance_cfg: instance_config)
   end
 
   # The full production key shape: config-name identity + secondary
@@ -95,11 +96,11 @@ class MlxSsotHarness
   end
 
   def build_callable(instance_config:)
-    Legion::Extensions::Llm::Mlx::Actor::MlxCallable.new(instance_cfg: instance_config, logger: Logger.new(File::NULL))
+    Legion::Extensions::Llm::Mlx::Helpers::Callable.new(instance_cfg: instance_config, logger: Logger.new(File::NULL))
   end
 
-  # Drafts are built by the production path — the actor's real
-  # build_offering_draft (EvidenceBuilding) — not a harness-side copy.
+  # Drafts are built by the production path — the runner's real
+  # build_offering_draft — not a harness-side copy.
   def build_offering_drafts(tier: :local, **)
     model_id = 'mlx-community/Llama-3.2-3B-Instruct-4bit'
     [production_draft(model_id: model_id, tier: tier)]
@@ -170,8 +171,7 @@ class MlxSsotHarness
 
   def production_draft(model_id:, tier:)
     config = INSTANCE_CONFIGS.first
-    ACTOR.new.send(
-      :build_offering_draft,
+    ACTOR.build_offering_draft(
       model_id: model_id,
       model_data: { id: model_id, max_model_len: 32_768 },
       instance_cfg: { mlx_api_base: config[:mlx_api_base], tier: tier },
@@ -189,11 +189,9 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     # The production callable dispatches through a real per-instance
     # Mlx::Provider built lazily from the instance config; the only seam
     # to run the dispatch ops offline is the shared HTTP boundary.
-    # rubocop:disable RSpec/AnyInstance -- the per-callable Provider is built lazily; the shared connection is the only offline seam
-    allow_any_instance_of(Legion::Extensions::Llm::Connection).to receive(:post) do |*_args|
+    allow_any_instance_of(Legion::Extensions::Llm::Connection).to receive(:post) do |*_args| # rubocop:disable RSpec/AnyInstance
       ssot_harness.stub_completion_response
     end
-    # rubocop:enable RSpec/AnyInstance
   end
 
   it_behaves_like 'an SSOT v3 provider adapter'
@@ -299,16 +297,16 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       end
     end
 
-    def offering_id_after_bring_up(config)
+    def lane_id_after_bring_up(config)
       result = bring_up_instance(config)
-      registry.snapshot.offerings_for(instance_key: result[:key]).first.offering_id
+      registry.snapshot.lanes_for(instance_key: result[:key]).first.lane_id
     end
 
-    it 'reproduces IDs after restart (identity is deterministic from inputs)' do
+    it 'reproduces lane IDs after restart (identity is deterministic from inputs)' do
       config = ssot_harness.instance_configs[0]
-      first_id = offering_id_after_bring_up(config)
+      first_id = lane_id_after_bring_up(config)
       registry.reset!
-      expect(offering_id_after_bring_up(config)).to eq(first_id)
+      expect(lane_id_after_bring_up(config)).to eq(first_id)
     end
   end
 
@@ -348,27 +346,39 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       )
     end
 
-    it 'preserves offering_id when tier changes from local to frontier' do
+    # SSOT: tier is the FIRST field of the 5-tuple lane id, so a tier change is a
+    # DIFFERENT lane by construction (an offering IS a 5-tuple lane). The other
+    # identity fields are preserved across the republication.
+    it 'changes the lane_id tier component when the tier changes' do
       config = ssot_harness.instance_configs[0]
       context = bring_up_with_tier(config, tier: :local)
-      before_id = registry.snapshot.offerings_for(instance_key: context[:key]).first.offering_id
+      local_lane = registry.snapshot.lanes_for(instance_key: context[:key]).first
       republish_with_tier(context, config, tier: :frontier)
-      expect(registry.snapshot.offerings_for(instance_key: context[:key]).first.offering_id).to eq(before_id)
+      frontier_lane = registry.snapshot.lanes_for(instance_key: context[:key]).first
+
+      expect(local_lane.lane_id).to start_with('local:mlx:')
+      expect(frontier_lane.lane_id).to start_with('frontier:mlx:')
+      expect(frontier_lane.lane_id).not_to eq(local_lane.lane_id)
     end
 
-    it 'preserves lane_id when tier changes from local to frontier' do
+    it 'preserves provider_family, instance_id, lane type, and model across a tier change' do
       config = ssot_harness.instance_configs[0]
       context = bring_up_with_tier(config, tier: :local)
-      before_lane_id = registry.snapshot.lanes_for(instance_key: context[:key]).first.lane_id
+      local_lane = registry.snapshot.lanes_for(instance_key: context[:key]).first
       republish_with_tier(context, config, tier: :frontier)
-      expect(registry.snapshot.lanes_for(instance_key: context[:key]).first.lane_id).to eq(before_lane_id)
+      frontier_lane = registry.snapshot.lanes_for(instance_key: context[:key]).first
+
+      expect(frontier_lane.provider_family).to eq(local_lane.provider_family)
+      expect(frontier_lane.instance_id).to eq(local_lane.instance_id)
+      expect(frontier_lane.operation).to eq(local_lane.operation)
+      expect(frontier_lane.model).to eq(local_lane.model)
     end
 
     it 'updates the tier value after republication' do
       config = ssot_harness.instance_configs[0]
       context = bring_up_with_tier(config, tier: :local)
       republish_with_tier(context, config, tier: :frontier)
-      expect(registry.snapshot.offerings_for(instance_key: context[:key]).first.tier).to eq(:frontier)
+      expect(registry.snapshot.lanes_for(instance_key: context[:key]).first.tier).to eq(:frontier)
     end
   end
 
@@ -395,13 +405,13 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     # The pattern under test is the PRODUCTION constant, not a copy.
     it 'matches known embedding model names against the production embedding pattern' do
-      pattern = Legion::Extensions::Llm::Mlx::Actor::EvidenceBuilding::EMBEDDING_PATTERN
+      pattern = Legion::Extensions::Llm::Mlx::Runners::Discovery::EMBEDDING_PATTERN
       expect(pattern).to match('BAAI/bge-large-en-v1.5')
       expect(pattern).to match('nomic-ai/nomic-embed-text-v1.5')
     end
 
     it 'does not match chat model names against the production embedding pattern' do
-      pattern = Legion::Extensions::Llm::Mlx::Actor::EvidenceBuilding::EMBEDDING_PATTERN
+      pattern = Legion::Extensions::Llm::Mlx::Runners::Discovery::EMBEDDING_PATTERN
       chat_model = 'mlx-community/Llama-3.2-3B-Instruct-4bit'
       expect(chat_model).not_to match(pattern)
     end
@@ -410,8 +420,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     # misroute to an embedding instance (chat is unsupported there).
     it 'publishes chat/stream_chat as unsupported and embed as supported for an embedding model' do
       embed_model = 'nomic-ai/nomic-embed-text-v1.5'
-      draft = Legion::Extensions::Llm::Mlx::Actor::DiscoveryRefresh.new.send(
-        :build_offering_draft,
+      draft = Legion::Extensions::Llm::Mlx::Runners::Discovery.build_offering_draft(
         model_id: embed_model,
         model_data: { id: embed_model, max_model_len: 512 },
         instance_cfg: config,
@@ -826,8 +835,8 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       publisher = Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
       callable = ssot_harness.build_callable(instance_config: config)
       token = claim_and_activate(publisher: publisher, callable: callable)
-      offering = registry.snapshot.offerings_for(instance_key: key).first
-      { publisher: publisher, token: token, offering: offering, callable: callable }
+      lane = registry.snapshot.lanes_for(instance_key: key).first
+      { publisher: publisher, token: token, offering: lane, callable: callable }
     end
 
     def claim_and_activate(publisher:, callable:)
@@ -867,7 +876,9 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     it 'rejects a mismatched offering_id' do
       activate_offering
-      bogus_id = 'off:v1:0000000000000000000000000000000000000000000000000000000000000000'
+      # A well-formed 5-tuple lane id that is NOT the activated lane: it passes
+      # validate_lane_id! and then resolves to nil in the snapshot → mismatch.
+      bogus_id = 'local:mlx:mac-studio-1:inference:some-other-model'
       envelope = build_envelope(offering_id: bogus_id, model: 'mlx-community/Llama-3.2-3B-Instruct-4bit')
       expect { Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry) }
         .to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
@@ -875,7 +886,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     it 'rejects an unsupported operation' do
       ctx = activate_offering
-      envelope = build_envelope(offering_id: ctx[:offering].offering_id, model: ctx[:offering].model,
+      envelope = build_envelope(offering_id: ctx[:offering].lane_id, model: ctx[:offering].model,
                                 operation: 'embed', params: { text: 'hello' })
       expect { Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry) }
         .to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
@@ -883,7 +894,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
 
     it 'rejects a mismatched model' do
       ctx = activate_offering
-      envelope = build_envelope(offering_id: ctx[:offering].offering_id, model: 'some-other-model/v1')
+      envelope = build_envelope(offering_id: ctx[:offering].lane_id, model: 'some-other-model/v1')
       expect { Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry) }
         .to raise_error(Legion::Extensions::Llm::Inventory::Errors::ExactOfferingMismatchError)
     end
@@ -892,7 +903,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
       ctx = activate_offering
       new_publisher = Legion::Extensions::Llm::Inventory::Publisher.new(provider_family: :mlx)
       claim_and_activate(publisher: new_publisher, callable: ssot_harness.build_callable(instance_config: config))
-      expect(registry.snapshot.offerings_for(instance_key: key).first.offering_id).to eq(ctx[:offering].offering_id)
+      expect(registry.snapshot.lanes_for(instance_key: key).first.lane_id).to eq(ctx[:offering].lane_id)
     end
 
     it 'rejects an unavailable instance' do
@@ -904,7 +915,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     end
 
     def execute_envelope(ctx)
-      envelope = build_envelope(offering_id: ctx[:offering].offering_id, model: ctx[:offering].model)
+      envelope = build_envelope(offering_id: ctx[:offering].lane_id, model: ctx[:offering].model)
       Legion::Extensions::Llm::Fleet::WorkerExecution.call(envelope: envelope, registry: registry)
     end
   end
@@ -914,11 +925,11 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
   describe 'dependency isolation' do
     it 'does not require Legion::LLM (no reverse dependency on top-level llm module)' do
       project_root = File.expand_path('../../../..', __dir__)
-      actor_file = File.read(File.join(project_root, 'lib/legion/extensions/llm/mlx/actors/discovery_refresh.rb'))
+      actor_file = File.read(File.join(project_root, 'lib/legion/extensions/llm/mlx/actors/discovery.rb'))
       expect(actor_file).not_to match(/\bLegion::LLM\b/)
     end
 
-    it 'MlxCallable does not reference Legion::LLM' do
+    it 'Callable does not reference Legion::LLM' do
       callable = ssot_harness.build_callable(instance_config: ssot_harness.instance_configs[0])
       outcome = callable.normalize_dispatch_error(error: RuntimeError.new('test'))
       expect(outcome).to be_a(Legion::Extensions::Llm::Routing::ProviderOutcome)
@@ -965,9 +976,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     def build_empty_model_offering
       harness = MlxSsotHarness.new
       config = harness.instance_configs.first
-      harness_class = MlxSsotHarness::ACTOR
-      harness_class.new.send(
-        :build_offering_draft,
+      MlxSsotHarness::ACTOR.build_offering_draft(
         model_id: '',
         model_data: { id: '' },
         instance_cfg: { mlx_api_base: config[:mlx_api_base], tier: :local },
@@ -976,9 +985,9 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     end
   end
 
-  # --- MlxCallable direct contract ---------------------------------------------
+  # --- Callable direct contract ---------------------------------------------
 
-  describe Legion::Extensions::Llm::Mlx::Actor::MlxCallable do
+  describe Legion::Extensions::Llm::Mlx::Helpers::Callable do
     let(:callable) do
       described_class.new(
         instance_cfg: ssot_harness.instance_configs[0],
@@ -1024,11 +1033,13 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     end
 
     it 'executes chat through the real per-instance provider path' do
-      message = Legion::Extensions::Llm::Message.new(role: :user, content: 'hello')
-      result = callable.chat(messages: [message], model: 'mlx-community/Llama-3.2-3B-Instruct-4bit',
-                             max_tokens: 100)
-      expect(result).to be_a(Legion::Extensions::Llm::Message)
-      expect(result.content).to eq('ssot stub response')
+      # Pipeline dispatch delivers Canonical::Message objects (N x N law); the
+      # dispatch boundary rejects anything else loudly.
+      message = Legion::Extensions::Llm::Canonical::Message.build(role: :user, content: 'hello')
+      result = callable.chat([message], model: 'mlx-community/Llama-3.2-3B-Instruct-4bit',
+                                        max_tokens: 100)
+      expect(result).to be_a(Legion::Extensions::Llm::Canonical::Response)
+      expect(result.text).to eq('ssot stub response')
       expect(callable.call_count).to eq(1)
     end
 
@@ -1045,7 +1056,7 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
         Legion::Extensions::Llm::Canonical::Message.build(role: :user, content: 'hello')
       ]
 
-      callable.chat(messages: messages, model: 'mlx-community/Llama-3.2-3B-Instruct-4bit')
+      callable.chat(messages, model: 'mlx-community/Llama-3.2-3B-Instruct-4bit')
 
       expect(captured.length).to eq(1)
       expect(captured.first[:url]).to eq('/v1/chat/completions')
@@ -1054,11 +1065,33 @@ RSpec.describe Legion::Extensions::Llm::Mlx do
     end
 
     it 'counts each dispatch op as an inference call' do
-      message = Legion::Extensions::Llm::Message.new(role: :user, content: 'hello')
-      callable.chat(messages: [message], model: 'm/v1')
+      message = Legion::Extensions::Llm::Canonical::Message.build(role: :user, content: 'hello')
+      callable.chat([message], model: 'm/v1')
       callable.count_tokens(messages: [message], model: 'm/v1')
       expect(callable.call_count).to eq(2)
     end
+
+    # ─── Dispatch boundary regression guard (2026-08-19 live repro) ─────────
+    it 'rejects plain Hash messages at the dispatch boundary instead of re-canonicalizing them' do
+      # The 2026-08-19 defect class: hash messages silently re-canonicalized
+      # provider-side masked the bypass for 25 failed openai dispatches. The
+      # boundary rejects loudly on every dispatch operation (callable entry,
+      # 12/O05; the base funnel enforces centrally, 08 F2).
+      hash_request = [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'ssot stub response' }
+      ]
+
+      expect { callable.chat(hash_request, model: 'm/v1') }
+        .to raise_error(ArgumentError, /Canonical::Message/)
+      expect { callable.count_tokens(messages: hash_request, model: 'm/v1') }
+        .to raise_error(ArgumentError, /Canonical::Message/)
+    end
+
+    # ─── 0.8.0 kit boundary groups (09 B1/B2, one oracle) ──────────────────
+
+    it_behaves_like 'B1 — central canonical enforcement (08 F2)'
+    it_behaves_like 'B2 — canonical outputs (05 O5, 08 R2)'
   end
 
   # --- OfferingDraft validation ------------------------------------------------
